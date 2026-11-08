@@ -1,3 +1,4 @@
+#include <emscripten.h>
 #include "moonlight_wasm.hpp"
 
 #include <condition_variable>
@@ -40,6 +41,22 @@ static uint32_t s_VideoFormat = 0;
 static uint32_t s_Width = 0;
 static uint32_t s_Height = 0;
 static uint32_t s_Framerate = 0;
+
+// MSE video backend (window.videoBackend = "mse"): frames go to platform/mse.js instead of EMSS.
+// Each frame is copied into a ring that the main thread reads from asynchronously, so the
+// ring has to hold every frame the main thread has not copied out yet.
+static bool s_UseMse = false;
+static constexpr size_t kMseRingSize = 8 * 1024 * 1024;
+static unsigned char s_MseRing[kMseRingSize];
+static size_t s_MseRingPos = 0;
+static int s_MseNeedIdr = 0;
+// Worker mode (mseOpts.worker): instead of a call on the main thread, each frame goes into this
+// queue and wakes mse.js's worker: [write count, then kMseSlots slots of kMseSlotInts ints:
+// pointer, length, IDR, frame number, PTS ms, receive time ms]
+static constexpr int kMseSlots = 64;
+static constexpr int kMseSlotInts = 8;
+static int32_t s_MseQueue[1 + kMseSlots * kMseSlotInts];
+static bool s_MseWorker = false;
 
 static std::vector<unsigned char> s_DecodeBuffer;
 
@@ -159,6 +176,29 @@ int MoonlightInstance::MediaSetupWaitFailed(const char* step) {
 }
 
 int MoonlightInstance::StartupVidDecSetup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
+  s_UseMse = MAIN_THREAD_EM_ASM_INT({
+    return (typeof window !== "undefined" && window.videoBackend === "mse") ? 1 : 0;
+  });
+  if (s_UseMse) {
+    s_MseRingPos = 0;
+    __atomic_store_n(&s_MseNeedIdr, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&s_MseQueue[0], 0, __ATOMIC_SEQ_CST);
+    int started = MAIN_THREAD_EM_ASM_INT({
+      return (typeof mseStart === "function") ? mseStart($0, $1, $2, $3, $4, $5) : 0;
+    }, videoFormat, width, height, redrawRate, (int)(size_t)&s_MseNeedIdr, (int)(size_t)&s_MseQueue[0]);
+    s_MseWorker = started == 2;
+    if (!started) {
+      ClLogMessage("The MSE video backend failed to start\n");
+      return ERROR_VIDEO_SETUP_FAILED;
+    }
+    if (g_Instance->m_AudioBackend == AudioBackend::Emss) {
+      ClLogMessage("MSE video backend: the EMSS audio track is never opened, so select Web Audio for sound\n");
+    }
+    g_Instance->m_VideoStarted = true;
+    ClLogMessage(s_MseWorker ? "MSE video backend started in a worker\n" : "MSE video backend started\n");
+    return 0;
+  }
+
   // Bind the media source to the media element
   g_Instance->m_MediaElement.SetSrc(g_Instance->m_Source.get());
   // Mark the source as attached, so that it gets closed if the connection fails from here on
@@ -366,6 +406,15 @@ int MoonlightInstance::VidDecSetup(int videoFormat, int width, int height, int r
 }
 
 void MoonlightInstance::VidDecCleanup(void) {
+  if (s_UseMse) {
+    s_UseMse = false;
+    s_MseWorker = false;
+    g_Instance->m_VideoStarted = false;
+    MAIN_THREAD_ASYNC_EM_ASM({
+      if (typeof mseStop === "function") mseStop();
+    });
+  }
+
   // Clear the decode buffer
   s_DecodeBuffer.clear();
 
@@ -430,7 +479,7 @@ int MoonlightInstance::VidDecSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
   uint32_t pacingStart = LiGetMillis();
 
   // Check if the frame pacing is enabled
-  if (s_FramePacingEnabled) {
+  if (s_FramePacingEnabled && !s_UseMse) {
     // Calculate the time elapsed since the first frame
     TimeStamp fromStart = now - s_firstAppend;
     // Wait until the packet timestamp is within the frame time margin
@@ -530,6 +579,49 @@ int MoonlightInstance::VidDecSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
   // Count the received frame and increment total frames
   m_ActiveWndVideoStats.receivedFrames++;
   m_ActiveWndVideoStats.totalFrames++;
+
+  if (s_UseMse) {
+    // 1: the JS side lost its decoding state and drops frames until an IDR, 2: it wants a keyframe
+    // to trim the buffer at, and keeps decoding meanwhile
+    int idrRequest = __atomic_exchange_n(&s_MseNeedIdr, 0, __ATOMIC_SEQ_CST);
+    if (idrRequest == 1 && decodeUnit->frameType != FRAME_TYPE_IDR) {
+      return DR_NEED_IDR;
+    }
+    if (idrRequest == 2) {
+      LiRequestIdrFrame();
+    }
+    if (offset > kMseRingSize / 4) {
+      ClLogMessage("MSE: dropping a %u byte frame that is too large for the ring\n", offset);
+      return DR_NEED_IDR;
+    }
+    if (s_MseRingPos + offset > kMseRingSize) {
+      s_MseRingPos = 0;
+    }
+    unsigned char* frame = s_MseRing + s_MseRingPos;
+    memcpy(frame, s_DecodeBuffer.data(), offset);
+    s_MseRingPos += offset;
+    m_ActiveWndVideoStats.totalReassemblyTime += (uint32_t)MAX(0, (int32_t)(decodeUnit->enqueueTimeMs - decodeUnit->receiveTimeMs));
+    m_ActiveWndVideoStats.decodedFrames++;
+    m_ActiveWndVideoStats.renderedFrames++;
+    if (s_MseWorker) {
+      int32_t n = __atomic_load_n(&s_MseQueue[0], __ATOMIC_SEQ_CST);
+      int32_t* slot = &s_MseQueue[1 + (n % kMseSlots) * kMseSlotInts];
+      slot[0] = (int32_t)(size_t)frame;
+      slot[1] = (int32_t)offset;
+      slot[2] = decodeUnit->frameType == FRAME_TYPE_IDR ? 1 : 0;
+      slot[3] = (int32_t)decodeUnit->frameNumber;
+      slot[4] = (int32_t)decodeUnit->presentationTimeMs;
+      slot[5] = (int32_t)decodeUnit->receiveTimeMs;
+      __atomic_store_n(&s_MseQueue[0], n + 1, __ATOMIC_SEQ_CST);
+      EM_ASM({ Atomics.notify(HEAP32, $0 >> 2, 1); }, (int)(size_t)&s_MseQueue[0]);
+    } else {
+      MAIN_THREAD_ASYNC_EM_ASM({
+        if (typeof _mseReceiveFrame === "function") _mseReceiveFrame($0, $1, $2, $3, $4, $5);
+      }, (int)(size_t)frame, (int)offset, decodeUnit->frameType == FRAME_TYPE_IDR ? 1 : 0,
+         decodeUnit->frameNumber, (int)decodeUnit->presentationTimeMs, (double)decodeUnit->receiveTimeMs);
+    }
+    return DR_OK;
+  }
 
   // Create an ElementaryMediaPacket and start decoding with the decoded video data
   samsung::wasm::ElementaryMediaPacket pkt {

@@ -457,7 +457,7 @@ function showHostsMode() {
   $('#listener').removeClass('fullscreen');
 
   Navigation.start();
-  Navigation.pop();
+  Navigation.reset(Views.Hosts);
   // Stop any existing polls before starting new ones to prevent setInterval leaks.
   // Without this, navigating back to the host view multiple times accumulates
   // duplicate polling intervals for each host, which causes race conditions in

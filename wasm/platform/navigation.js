@@ -1979,11 +1979,21 @@ const Navigation = (function() {
       }
     }
 
+    function reset(view) {
+      if (get()) {
+        get().leave();
+      }
+      viewStack.length = 0;
+      viewStack.push(view);
+      get().enter();
+    }
+
     return {
       get,
       push,
       change,
-      pop
+      pop,
+      reset
     };
   })();
 
@@ -2027,6 +2037,7 @@ const Navigation = (function() {
     push: Stack.push,
     change: Stack.change,
     pop: Stack.pop,
+    reset: Stack.reset,
     start: State.start,
     stop: State.stop,
   };

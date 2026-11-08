@@ -2832,10 +2832,15 @@ function startGame(host, appID) {
   }
   localStorage.setItem('lastOpenedApp_' + host.serverUid, appID);
 
+  // HEVC streams use the MSE video backend, because the EMSS player on Tizen 9 caps at 60 FPS or
+  // garbles anything faster, and the MSE backend shows 120 FPS. The MSE backend never opens the
+  // EMSS audio track, so these streams play their sound through Web Audio.
+  window.mseActive = $('#selectCodec').data('value') === 'HEVC';
+
   // Start the audio scheduler of the Web Audio backend while we are still running inside the
   // handler of the key press that started the stream, because the audio context of a device
   // with an autoplay policy can only be created from a user gesture
-  if (isWebAudioBackendSelected()) {
+  if (isWebAudioBackendSelected() || (window.mseActive && !isAudioOutputDisabled())) {
     startAudioScheduler();
   }
 
@@ -2910,6 +2915,9 @@ function startGame(host, appID) {
       const flipABfaceButtons = $('#flipABfaceButtonsSwitch').parent().hasClass('is-checked') ? 1 : 0;
       const flipXYfaceButtons = $('#flipXYfaceButtonsSwitch').parent().hasClass('is-checked') ? 1 : 0;
       var audioBackend = $('#selectAudioBackend').data('value').toString();
+      if (window.mseActive && audioBackend === 'EMSS') {
+        audioBackend = 'WebAudio';
+      }
       var audioConfig = $('#selectAudio').data('value').toString();
       const audioSync = $('#audioSyncSwitch').parent().hasClass('is-checked') ? 1 : 0;
       const audioJitter = parseInt($('#jitterSlider').val());

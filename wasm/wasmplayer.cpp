@@ -42,7 +42,7 @@ static uint32_t s_Width = 0;
 static uint32_t s_Height = 0;
 static uint32_t s_Framerate = 0;
 
-// MSE video backend (window.videoBackend = "mse"): frames go to platform/mse.js instead of EMSS.
+// MSE video backend (window.mseActive): frames go to platform/mse.js instead of EMSS.
 // Each frame is copied into a ring that the main thread reads from asynchronously, so the
 // ring has to hold every frame the main thread has not copied out yet.
 static bool s_UseMse = false;
@@ -177,7 +177,7 @@ int MoonlightInstance::MediaSetupWaitFailed(const char* step) {
 
 int MoonlightInstance::StartupVidDecSetup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
   s_UseMse = MAIN_THREAD_EM_ASM_INT({
-    return (typeof window !== "undefined" && window.videoBackend === "mse") ? 1 : 0;
+    return (typeof window !== "undefined" && window.mseActive === true) ? 1 : 0;
   });
   if (s_UseMse) {
     s_MseRingPos = 0;

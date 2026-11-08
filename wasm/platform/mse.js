@@ -1,4 +1,4 @@
-// MSE video backend for the TV, used when window.videoBackend === 'mse'.
+// MSE video backend for the TV, used for HEVC streams (window.mseActive).
 // The WASM module calls mseStart() when the video stream is set up, _mseReceiveFrame() for every
 // frame (Annex B HEVC, read from the WASM heap) and mseStop() when the stream ends. Each frame is
 // wrapped in its own fMP4 fragment and appended to a MediaSource, which Tizen decodes through the
@@ -35,10 +35,10 @@
 //                while the stream runs; the stream's own input goes through the C++ side
 //   wake:        how the worker waits for the next frame: 'async' (Atomics.waitAsync), 'spin' (busy poll
 //                through its task queue), 'timer' (setTimeout 1), 'wait' (Atomics.wait up to waitMs, then yield)
-// window.padMode = 'main' (set before the stream starts) polls the gamepads from a 4 ms timer on the
-// main thread instead of Moonlight's input thread, whose every gamepad call waits for the main thread.
-var MSE_DEFAULTS = { pts: 'host', rateAbove: 30, rateHi: 1.05, rateBelow: 15, rateLo: 0.95, rateUntil: null, rateWindow: 0, seekAbove: 400, seekTarget: 30,
-                     startAhead: 20, idrEvery: 5000, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: false, wake: 'async', waitMs: 3, reuse: true, uiPad: false };
+// The backend polls the gamepads from a 4 ms timer on the main thread instead of Moonlight's input
+// thread, whose every gamepad call waits for the main thread.
+var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 30,
+                     startAhead: 20, idrEvery: 5000, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'async', waitMs: 3, reuse: true, uiPad: false };
 var MSE_TIMESCALE = 90000;
 // Kept across a hot reload, so a running stream's video element is not orphaned over the UI
 var _mse = window._mse || null;
@@ -301,7 +301,7 @@ function mseStart(videoFormat, width, height, fps, needIdrAddr, queueAddr) {
     Controller.stopWatching();
     s.uiPadStopped = true;
   }
-  if (window.padMode === 'main' && typeof Module !== 'undefined' && typeof Module._mlPollGamepadsMain === 'function') {
+  if (typeof Module !== 'undefined' && typeof Module._mlPollGamepadsMain === 'function') {
     s.padTimer = setInterval(Module._mlPollGamepadsMain, 4);
   }
   video.addEventListener('waiting', function () { if (_mse === s) { s.stats.waiting++; _mseEvent('waiting'); } });

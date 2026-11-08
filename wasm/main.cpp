@@ -194,9 +194,9 @@ void MoonlightInstance::CloseMediaSource() {
   m_SourceAttached = false;
 }
 
-// Experiment: with window.padMode === "main", mse.js calls mlPollGamepadsMain() on a timer on the
-// browser main thread and the input thread skips the gamepads. From the input thread every
-// emscripten gamepad call is proxied to the main thread and waits for it, three times per poll.
+// With the MSE video backend, mse.js calls mlPollGamepadsMain() on a timer on the browser main
+// thread and the input thread skips the gamepads. From the input thread every emscripten gamepad
+// call is proxied to the main thread and waits for it, three times per poll.
 static std::atomic<bool> s_PadOnMain{false};
 
 extern "C" EMSCRIPTEN_KEEPALIVE void mlPollGamepadsMain() {
@@ -207,7 +207,7 @@ void* MoonlightInstance::InputThreadFunc(void* context) {
   MoonlightInstance* me = (MoonlightInstance*)context;
 
   s_PadOnMain = MAIN_THREAD_EM_ASM_INT({
-    return (typeof window !== "undefined" && window.padMode === "main") ? 1 : 0;
+    return (typeof window !== "undefined" && window.mseActive === true) ? 1 : 0;
   }) != 0;
   if (s_PadOnMain) ClLogMessage("Gamepads are polled on the main thread\n");
 

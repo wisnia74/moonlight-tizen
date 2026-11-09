@@ -12,7 +12,14 @@
 //   seekAbove:  jump to the live edge when more than this is buffered ahead
 //   seekTarget: how much to leave buffered after such a jump
 //   startAhead: buffered time needed before playback starts
-//   idrEvery:   how often to ask the host for a keyframe, which is where the buffer can be trimmed
+//   idrMB:      ask the host for a keyframe once this many MB of video have arrived since the last
+//               one. The buffer can be trimmed only at a keyframe, and the TV's player refuses
+//               appends once about 80 MB are buffered. At the stream's full bitrate the buffer peaks
+//               up to about 10 MB above this value. Each keyframe shows as a brief flicker, so a
+//               size limit asks for far fewer of them than a fixed interval would.
+//   sceneMB, sceneRatio: once sceneMB have arrived since the last keyframe, ask for one right after
+//               a frame sceneRatio times bigger than the recent average, such as a cut or a fade,
+//               where its flicker cannot be seen
 //   durMs:      declared frame duration. MSE drops every frame up to the next keyframe after a
 //               timestamp gap over twice the previous frame's duration, and the stream has
 //               keyframes only on request, so this has to cover the longest gap between frames.
@@ -38,7 +45,7 @@
 // The backend polls the gamepads from a 4 ms timer on the main thread instead of Moonlight's input
 // thread, whose every gamepad call waits for the main thread.
 var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 30,
-                     startAhead: 20, idrEvery: 5000, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'async', waitMs: 3, reuse: true, uiPad: false };
+                     startAhead: 20, idrMB: 50, sceneMB: 8, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'async', waitMs: 3, reuse: true, uiPad: false };
 var MSE_TIMESCALE = 90000;
 // Kept across a hot reload, so a running stream's video element is not orphaned over the UI
 var _mse = window._mse || null;
@@ -283,7 +290,7 @@ function mseStart(videoFormat, width, height, fps, needIdrAddr, queueAddr) {
     video: video, ms: ms, sb: null, width: width, height: height, fps: fps, main10: main10, opts: startOpts,
     live: startOpts.live, mux: startOpts.mux, appendAt: null,
     needIdrAddr: needIdrAddr, waitIdr: true, params: null, seq: 1, firstPts: null, t0: null,
-    pending: [], open: false, playing: false, timer: null, lastTrim: 0, lastIdrRequest: performance.now(), keyTimes: [],
+    pending: [], open: false, playing: false, timer: null, lastTrim: 0, keyTimes: [],
     stats: null, events: [], lastCt: -1, lastCtAt: 0, stalled: false,
   };
   _mseResetStats();
@@ -370,7 +377,7 @@ function _mseWorkerMain() {
     var s = _mse = {
       video: { get currentTime() { return ctl[0]; } }, ms: ms, sb: null, width: m.width, height: m.height, fps: m.fps, main10: m.main10,
       opts: m.opts, live: m.opts.live, mux: m.opts.mux, appendAt: null, needIdrAddr: m.needIdrAddr, waitIdr: true, params: null,
-      seq: 1, firstPts: null, t0: null, pending: [], open: false, lastTrim: 0, lastIdrRequest: performance.now(), keyTimes: [], stats: null,
+      seq: 1, firstPts: null, t0: null, pending: [], open: false, lastTrim: 0, keyTimes: [], stats: null,
     };
     _mseShareCtl(s, ctl);
     _mseResetStats();
@@ -482,6 +489,18 @@ function _mseReceiveFrame(ptr, len, idr, frameNumber, ptsMs, recvMs) {
   }
   if (nalStart >= 0 && nalType !== 38) payload += len - nalStart;
   s.stats.sizes.push(payload);
+  if (idr) { s.keyBytes = 0; s.askedAt = null; }
+  else {
+    var avg = s.avgBytes || payload, mb = 1048576;
+    s.keyBytes = (s.keyBytes || 0) + payload;
+    var scene = s.keyBytes > s.opts.sceneMB * mb && payload > s.opts.sceneRatio * avg;
+    if ((scene || s.keyBytes > s.opts.idrMB * mb) && (s.askedAt === null || s.askedAt === undefined || s.keyBytes - s.askedAt > 4 * mb)) {
+      s.askedAt = s.keyBytes;
+      Atomics.store(HEAP32, s.needIdrAddr >> 2, 2);
+      _mseEvent('idrReq', scene ? 'scene' : 'size');
+    }
+    s.avgBytes = avg * 0.95 + payload * 0.05;
+  }
   if (s.waitIdr && !idr) { s.stats.dropped++; return; }
   var d = HEAPU8.subarray(ptr, ptr + len);
   var vps = null, sps = null, pps = null, sample = null, k = 0, sampleLen = 0, i, type;
@@ -586,11 +605,6 @@ function _msePump() {
   // where one was requested, so the buffer is trimmed only up to a keyframe behind playback
   if (now - s.lastTrim > 1000 && s.sb.buffered.length) {
     s.lastTrim = now;
-    if (now - s.lastIdrRequest > s.opts.idrEvery) {
-      s.lastIdrRequest = now;
-      Atomics.store(HEAP32, s.needIdrAddr >> 2, 2);
-      _mseEvent('idrReq');
-    }
     var cut = null;
     while (s.keyTimes.length > 1 && s.keyTimes[1] < v.currentTime - 0.5) cut = s.keyTimes.shift();
     if (cut !== null && s.keyTimes[0] > s.sb.buffered.start(0) + 0.1) {
@@ -769,9 +783,9 @@ function latOverlay(on) {
 }
 
 // ---- Gamepad timing ----
-// Records every button edge the TV's Gamepad API reports, in homelab time (window.hostOffsetMs,
-// set by tv-clock-sync.py): [poll time, gamepad.timestamp, pad index, button, pressed]. The host
-// side logs the matching edges on Sunshine's virtual pad (input-log.py); pad-split.py joins them.
+// Records every button edge the TV's Gamepad API reports, in homelab time:
+// [poll time, gamepad.timestamp, pad index, button, pressed]. The host's latency tool sets
+// window.hostOffsetMs and matches these edges against Sunshine's virtual pad.
 
 var _padLog = null;
 

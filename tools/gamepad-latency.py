@@ -4,10 +4,10 @@
 Moonlight must run on the TV in debug mode with its inspector port forwarded to localhost
 (sdb forward), and a stream must be running. Press buttons on the TV's pad while it records.
 
-    pad-latency.py <inspector port> [seconds]
-    pad-latency.py --reanalyse <saved json>
+    gamepad-latency.py <inspector port> [seconds]
+    gamepad-latency.py --reanalyse <saved json>
 
-Each recording is saved to /tmp/pad-latency.json.
+Each recording is saved to /tmp/gamepad-latency.json.
 """
 
 import base64
@@ -172,7 +172,7 @@ def main():
     host = record_host(path, seconds)
     tv = json.loads(insp.evaluate("padLogDump()"))["events"]
     insp.evaluate("padLog(false)")
-    json.dump({"rtt": rtt, "tv": tv, "host": host}, open("/tmp/pad-latency.json", "w"))
+    json.dump({"rtt": rtt, "tv": tv, "host": host}, open("/tmp/gamepad-latency.json", "w"))
     analyse(tv, host)
 
 

@@ -43,6 +43,28 @@ var AUD_POLL_INTERVAL_MS = 20;
 // Most frames that one audio buffer may carry
 var AUD_MAX_BATCH = 8;
 
+// Number of polls whose median headroom decides the playback speed. A poll that a stall of the
+// main thread delayed reads low without the schedule being low, and the median ignores it.
+var AUD_STEER_POLLS = 25;
+
+// Distance of the schedule from the jitter buffer target, in seconds, at which the playback
+// speed starts to correct it
+var AUD_STEER_START = 0.020;
+
+// Distance from the target at which the correction stops
+var AUD_STEER_STOP = 0.005;
+
+// Distance above the target from which the correction uses the larger speed change
+var AUD_STEER_FAR = 0.080;
+
+// Change of the playback speed while the schedule is corrected. The pitch moves by the same
+// fraction, so the change is kept small.
+var AUD_STEER_STEP = 0.01;
+
+// Change of the playback speed while the schedule is far above the target, where the small
+// change would leave the audio delayed for many seconds
+var AUD_STEER_STEP_FAR = 0.03;
+
 // Time on the audio hardware clock, in seconds, at which the next frame should start playing
 var _audNextTime = 0.0;
 
@@ -54,8 +76,22 @@ var _audRunning = false;
 var _audStreamRate = 0;
 
 // Number of samples of the stream consumed for every sample handed to the audio hardware. This
-// is 1 while the audio context runs at the sample rate of the stream, which is the usual case.
+// is 1 while the audio context runs at the sample rate of the stream and the playback speed is
+// 1, which is the usual case.
 var _audRatio = 1.0;
+
+// Ratio of the sample rate of the stream to the sample rate of the audio context
+var _audRateRatio = 1.0;
+
+// Speed the stream is played at, which leaves 1 only while _audSteer() corrects the schedule
+var _audSpeed = 1.0;
+
+// End of the schedule and position of the audio hardware clock at the most recent polls, both
+// in seconds ahead of the page clock, and the number of polls recorded
+var _audLevels = new Float64Array(AUD_STEER_POLLS);
+var _audLevelsSorted = new Float64Array(AUD_STEER_POLLS);
+var _audClockLeads = new Float64Array(AUD_STEER_POLLS);
+var _audLevelCount = 0;
 
 // Position of the next output sample within the current frame, in samples of the stream. It is
 // carried over from one frame to the next so that resampling never restarts mid stream.
@@ -77,6 +113,7 @@ function _audResetStatistics() {
     droppedFull: 0,
     droppedEmpty: 0,
     notRunning: 0,
+    corrected: 0,
     resyncs: 0,
     underruns: 0,
     decoderGaps: 0,
@@ -120,8 +157,8 @@ function _audRecordHeadroom(headroomSeconds) {
 //   latency   the latency the audio context reports, which is the delay the frames are played
 //             with on top of the jitter buffer
 //   frames    frames received, scheduled, dropped because the jitter buffer was full, dropped
-//             because resampling produced no samples, and received while the context was not
-//             running
+//             because resampling produced no samples, received while the context was not
+//             running, and scheduled at a playback speed other than 1
 //   resync    times the schedule was primed to the jitter buffer again, of which underruns are
 //             the ones that happened after playback had already started, so each one of them
 //             is a hole in the output
@@ -151,6 +188,7 @@ function _audLogStatistics(force) {
     ' dropped=' + stats.droppedFull +
     ' empty=' + stats.droppedEmpty +
     ' idle=' + stats.notRunning +
+    ' corrected=' + stats.corrected +
     ' | resync=' + stats.resyncs +
     ' underrun=' + stats.underruns +
     ' gaps=' + stats.decoderGaps +
@@ -192,6 +230,9 @@ function startAudioScheduler() {
   _audRunning = true;
   _audStreamRate = 0;
   _audRatio = 1.0;
+  _audRateRatio = 1.0;
+  _audSpeed = 1.0;
+  _audLevelCount = 0;
   _audPhase = 0.0;
   _audTail = null;
   _audResetStatistics();
@@ -240,6 +281,10 @@ function _audPoll() {
   var heap = Module.HEAP32;
   var written = Atomics.load(heap, queue.count);
 
+  if (written !== queue.read) {
+    _audSteer();
+  }
+
   // Skip the frames whose slots were written again before this poll got to them
   if (written < queue.read || written - queue.read > queue.slotCount / 2) {
     queue.read = Math.max(0, written - queue.slotCount / 2);
@@ -249,8 +294,8 @@ function _audPoll() {
     var samples = heap[queue.count + 1 + slot];
     var offsets = [queue.slots + slot * queue.slotBytes];
 
-    // Frames of the same length go out as one audio buffer when no resampling is involved
-    if (_audStreamRate === queue.sampleRate && _audRatio === 1.0) {
+    // Frames of the same length go out as one audio buffer once the format of the stream is known
+    if (_audStreamRate === queue.sampleRate) {
       while (queue.read + offsets.length < written && offsets.length < AUD_MAX_BATCH) {
         var next = (queue.read + offsets.length) % queue.slotCount;
         if (heap[queue.count + 1 + next] !== samples) {
@@ -278,6 +323,9 @@ function stopAudioScheduler() {
   _audNextTime = 0.0;
   _audStreamRate = 0;
   _audRatio = 1.0;
+  _audRateRatio = 1.0;
+  _audSpeed = 1.0;
+  _audLevelCount = 0;
   _audPhase = 0.0;
   _audTail = null;
   _audStats = null;
@@ -297,7 +345,10 @@ function stopAudioScheduler() {
 // Adopt the format of the stream, which is only known once the first frame has been decoded
 function _audAdoptStreamFormat(sampleRate, channels) {
   _audStreamRate = sampleRate;
-  _audRatio = sampleRate / _audContext.sampleRate;
+  _audRateRatio = sampleRate / _audContext.sampleRate;
+  _audSpeed = 1.0;
+  _audRatio = _audRateRatio;
+  _audLevelCount = 0;
   _audPhase = 0.0;
   _audTail = null;
 
@@ -312,13 +363,87 @@ function _audAdoptStreamFormat(sampleRate, channels) {
     ' with a jitter buffer of ' + (window._mlAudioTargetMs || AUD_DEFAULT_TARGET_MS) + ' ms.');
 }
 
-// Copy one frame out of the WASM heap into an audio buffer, resampling it to the sample rate of
-// the audio context when the two differ. The resampler interpolates from the last sample of the
-// previous frame and carries its position over, so no discontinuity is introduced at the frame
-// boundaries. Returns the buffer to schedule, or null when the frame produced no samples.
+function _audSetSpeed(speed) {
+  _audSpeed = speed;
+  _audRatio = _audRateRatio * speed;
+
+  // Frames are copied without resampling from here on, so the position and the tail would be
+  // those of a frame played long before by the time resampling starts again
+  if (_audRatio === 1.0) {
+    _audPhase = 0.0;
+    _audTail = null;
+  }
+}
+
+// Choose the playback speed from the headroom of the schedule, once per poll.
+//
+// A resync primes the schedule to the whole jitter buffer, and the frames that were held up
+// behind the stall then arrive on top of it. Nothing else removes that surplus: the schedule
+// stays above the target as added audio delay, close to the limit at which frames are dropped,
+// and every dropped frame is a hole in the output. Playing slightly faster removes the surplus
+// without a hole. A schedule that late frames left below the target is raised the same way,
+// because there the next stall of the main thread causes an underrun.
+function _audSteer() {
+  if (!_audContext || _audContext.state !== 'running' || _audNextTime === 0.0) {
+    return;
+  }
+
+  // A schedule behind the clock is primed again by the next frame, which also restarts the record
+  var clock = _audContext.currentTime;
+  if (_audNextTime < clock) {
+    return;
+  }
+
+  // The audio hardware clock moves in steps as long as the block of samples the TV renders at
+  // once, so the headroom read from it rises and falls by that length between two steps. The
+  // page clock moves evenly: against it the steps of the audio clock show as a band, and the
+  // middle of that band is the position the schedule is measured from.
+  var page = performance.now() / 1000.0;
+  var slot = _audLevelCount % AUD_STEER_POLLS;
+  _audLevels[slot] = _audNextTime - page;
+  _audClockLeads[slot] = clock - page;
+  _audLevelCount++;
+  if (_audLevelCount < AUD_STEER_POLLS) {
+    return;
+  }
+
+  var leadMin = Infinity;
+  var leadMax = -Infinity;
+  for (var index = 0; index < AUD_STEER_POLLS; index++) {
+    leadMin = Math.min(leadMin, _audClockLeads[index]);
+    leadMax = Math.max(leadMax, _audClockLeads[index]);
+  }
+  _audLevelsSorted.set(_audLevels);
+  _audLevelsSorted.sort();
+  var target = (window._mlAudioTargetMs || AUD_DEFAULT_TARGET_MS) / 1000.0;
+  var surplus = _audLevelsSorted[AUD_STEER_POLLS >> 1] - (leadMin + leadMax) / 2.0 - target;
+
+  var speed = _audSpeed;
+  if (speed === 1.0) {
+    if (surplus > AUD_STEER_START) {
+      speed = 1.0 + AUD_STEER_STEP;
+    } else if (surplus < -AUD_STEER_START) {
+      speed = 1.0 - AUD_STEER_STEP;
+    }
+  } else if (speed > 1.0 ? surplus <= AUD_STEER_STOP : surplus >= -AUD_STEER_STOP) {
+    speed = 1.0;
+  }
+  if (speed > 1.0) {
+    speed = 1.0 + (surplus > AUD_STEER_FAR ? AUD_STEER_STEP_FAR : AUD_STEER_STEP);
+  }
+
+  if (speed !== _audSpeed) {
+    _audSetSpeed(speed);
+  }
+}
+
+// Copy frames out of the WASM heap into one audio buffer, resampling them when the sample rate
+// of the audio context differs from the one of the stream or the playback speed is not 1. The
+// resampler interpolates from the last sample of the previous frame and carries its position
+// over, so no discontinuity is introduced at the frame boundaries. Returns the buffer to
+// schedule, or null when the frames produced no samples.
 function _audBuildBuffer(heapOffset, samples, channels, stride, offsets) {
   var heap = Module.HEAPF32;
-  var base = heapOffset >> 2;
   var channel;
 
   if (_audRatio === 1.0) {
@@ -334,40 +459,53 @@ function _audBuildBuffer(heapOffset, samples, channels, stride, offsets) {
     return direct;
   }
 
-  // Emit one sample for every position of the schedule that still falls inside this frame. The
-  // position may start just before the frame, in which case the first sample is interpolated
-  // from the tail of the previous frame that is held in _audTail.
-  var count = Math.max(0, Math.ceil((samples - 1 - _audPhase) / _audRatio));
-  var buffer = count > 0 ? _audContext.createBuffer(channels, count, _audContext.sampleRate) : null;
+  // Emit one sample for every position of the schedule that still falls inside a frame. The
+  // position may start just before a frame, in which case the first sample is interpolated
+  // from the tail of the frame before it, which _audTail holds across calls.
+  var list = offsets || [heapOffset];
+  var total = 0;
+  var phase = _audPhase;
+  var count, item;
+  for (item = 0; item < list.length; item++) {
+    count = Math.max(0, Math.ceil((samples - 1 - phase) / _audRatio));
+    total += count;
+    phase += count * _audRatio - samples;
+  }
+  var buffer = total > 0 ? _audContext.createBuffer(channels, total, _audContext.sampleRate) : null;
 
   if (!_audTail || _audTail.length !== channels) {
     _audTail = new Float32Array(channels);
   }
 
   for (channel = 0; channel < channels; channel++) {
-    var source = base + channel * stride;
+    var output = buffer ? buffer.getChannelData(channel) : null;
     var tail = _audTail[channel];
+    var written = 0;
+    phase = _audPhase;
 
-    if (buffer) {
-      var output = buffer.getChannelData(channel);
-      var position = _audPhase;
+    for (item = 0; item < list.length; item++) {
+      var source = (list[item] >> 2) + channel * stride;
+      count = Math.max(0, Math.ceil((samples - 1 - phase) / _audRatio));
       for (var index = 0; index < count; index++) {
+        var position = phase + index * _audRatio;
         var whole = Math.floor(position);
         var fraction = position - whole;
         // A position before the frame reads the last sample of the previous one, and the
         // position never reaches the last sample of this frame, so whole + 1 stays in range
         var first = whole < 0 ? tail : heap[source + whole];
         var second = heap[source + whole + 1];
-        output[index] = first + (second - first) * fraction;
-        position += _audRatio;
+        output[written++] = first + (second - first) * fraction;
       }
+      tail = heap[source + samples - 1];
+
+      // Move the position of the next output sample into the frame that follows this one
+      phase += count * _audRatio - samples;
     }
 
-    _audTail[channel] = heap[source + samples - 1];
+    _audTail[channel] = tail;
   }
 
-  // Move the position of the next output sample into the frame that follows this one
-  _audPhase = _audPhase + count * _audRatio - samples;
+  _audPhase = phase;
 
   return buffer;
 }
@@ -433,6 +571,8 @@ function _audReceiveFrame(heapOffset, samples, channels, sampleRate, stride, seq
       stats.underruns++;
     }
     _audNextTime = now + targetSeconds;
+    _audLevelCount = 0;
+    _audSetSpeed(1.0);
     _audPhase = 0.0;
     _audTail = null;
     stats.resyncs++;
@@ -461,6 +601,9 @@ function _audReceiveFrame(heapOffset, samples, channels, sampleRate, stride, seq
 
   _audRecordHeadroom(_audNextTime - now);
   stats.scheduled++;
+  if (_audSpeed !== 1.0) {
+    stats.corrected += frameCount;
+  }
 
   _audNextTime += buffer.duration;
   _audLogStatistics(false);

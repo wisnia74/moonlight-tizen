@@ -35,6 +35,11 @@ using EmssRenderingMode = samsung::wasm::ElementaryMediaStreamSource::RenderingM
 
 MoonlightInstance* g_Instance;
 
+// A hand-over restarts threads that LiStopConnection() joins, so the stop thread waits for a
+// hand-over to finish before it stops the connection. The mutex makes sure the stop thread
+// sees a hand-over that began just before it looked.
+static std::mutex s_RespawnMutex;
+
 MoonlightInstance::MoonlightInstance()
   : m_AudioBackend(AudioBackend::Emss),
     m_AudioJitterMs(0),
@@ -66,6 +71,7 @@ MoonlightInstance::MoonlightInstance()
     m_VideoTrack(),
     m_ConnectionCancelled(false),
     m_StopThread(0),
+    m_RespawnThread(0),
     m_SourceClosed(false),
     m_SourceAttached(false) {
       m_Dispatcher.start();
@@ -137,6 +143,16 @@ void* MoonlightInstance::StopThreadFunc(void* context) {
     g_Instance->m_InputThread = 0;
   }
 
+  pthread_t respawnThread;
+  {
+    std::lock_guard<std::mutex> lock(s_RespawnMutex);
+    respawnThread = g_Instance->m_RespawnThread;
+    g_Instance->m_RespawnThread = 0;
+  }
+  if (respawnThread != 0) {
+    pthread_join(respawnThread, NULL);
+  }
+
   // Stop the connection
   LiStopConnection();
 
@@ -201,6 +217,29 @@ static std::atomic<bool> s_PadOnMain{false};
 
 extern "C" EMSCRIPTEN_KEEPALIVE void mlPollGamepadsMain() {
   if (g_Instance && s_PadOnMain.load()) g_Instance->PollGamepads();
+}
+
+void* MoonlightInstance::RespawnThreadFunc(void* context) {
+  LiRespawnStreamThreads();
+  return NULL;
+}
+
+int MoonlightInstance::RespawnStreamThreads() {
+  std::lock_guard<std::mutex> lock(s_RespawnMutex);
+  if (!m_Running || m_RespawnThread != 0) return 0;
+
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, MoonlightInstance::RespawnThreadFunc, NULL) != 0) return 0;
+  m_RespawnThread = thread;
+  return 1;
+}
+
+// The page calls this once the app's idle threads have been replaced with new ones. The
+// hand-over joins threads, which the browser's main thread must not wait for, so it runs on
+// a thread of its own. Returns 1 when it started, and 0 when no stream is running or this
+// stream already had one.
+extern "C" EMSCRIPTEN_KEEPALIVE int mlRespawnStreamThreads() {
+  return g_Instance ? g_Instance->RespawnStreamThreads() : 0;
 }
 
 void* MoonlightInstance::InputThreadFunc(void* context) {

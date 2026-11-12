@@ -37,6 +37,15 @@
 //               else raises a buffer that sits at the floor, where playback pauses for a frame at a
 //               time. The median decides here because single late frames pull the minimum down without
 //               the level being low, and the short window stops the slow-down before it overshoots.
+//   rebuildAt:  page age (performance.now()) at which the app replaces the threads it created
+//               before then, 0 = never. When the app is one minute old, the TV starts to hold
+//               back every thread that exists at that moment, for as long as the thread lives. A
+//               thread created after that moment runs at full speed, and the value leaves a
+//               margin after the minute. At this age the app replaces its idle wasm threads, so
+//               a stream that starts later runs on new threads only. A stream that is already
+//               running started on the old ones, where the player's worker appends late and the
+//               network threads read and send late. It gets a new player, and its receive and
+//               input loops move to new threads. The picture is gone while the new player starts.
 // Read once when the stream starts (the rest also apply live through mseSetOpts):
 //   live:        how the init segment declares its duration. 'none': mvhd 0 and no mehd (Chromium
 //                already reads that as a live stream), 'mehd0': adds an mehd box of 0, 'max': all
@@ -55,7 +64,7 @@
 // The backend polls the gamepads from a 4 ms timer on the main thread instead of Moonlight's input
 // thread, whose every gamepad call waits for the main thread.
 var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 30,
-                     startAhead: 20, idrMB: 50, sceneMB: 30, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'block', waitMs: 3, reuse: true, uiPad: false, trimSlice: 1, trimGap: 50, diag: false, floorFrames: 4, margin: 12, marginHi: 37, marginLo: 10, marginMid: 18, gridPhase: true };
+                     startAhead: 20, idrMB: 50, sceneMB: 30, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'block', waitMs: 3, reuse: true, uiPad: false, trimSlice: 1, trimGap: 50, diag: false, floorFrames: 4, margin: 12, marginHi: 37, marginLo: 10, marginMid: 18, rebuildAt: 63000, gridPhase: true };
 var MSE_TIMESCALE = 90000;
 // Kept across a hot reload, so a running stream's video element is not orphaned over the UI
 var _mse = window._mse || null;
@@ -269,7 +278,7 @@ function _mseStageAdd(s, bytes) {
 
 // ---- Playback ----
 
-function mseStart(videoFormat, width, height, fps, needIdrAddr, queueAddr) {
+function mseStart(videoFormat, width, height, fps, needIdrAddr, queueAddr, replacing) {
   mseStop();
   var hevc = (videoFormat & 0x0100) !== 0, main10 = (videoFormat & 0x0200) !== 0;
   if (!hevc && !main10) {
@@ -302,6 +311,7 @@ function mseStart(videoFormat, width, height, fps, needIdrAddr, queueAddr) {
     needIdrAddr: needIdrAddr, waitIdr: true, params: null, seq: 1, firstPts: null, t0: null,
     pending: [], open: false, playing: false, timer: null, lastTrim: 0, keyTimes: [],
     stats: null, events: [], lastCt: -1, lastCtAt: 0, stalled: false,
+    bornAt: performance.now(), startArgs: [videoFormat, width, height, fps, needIdrAddr, queueAddr], replacing: !!replacing,
   };
   _mseResetStats();
   if (useWorker) {
@@ -366,7 +376,7 @@ function _mseStartWorker(s, queueAddr) {
     }
   };
   s.worker.postMessage({ type: 'init', buffer: HEAPU8.buffer, ctl: ctl.buffer, queueAddr: queueAddr, needIdrAddr: s.needIdrAddr,
-                         width: s.width, height: s.height, fps: s.fps, main10: s.main10, opts: s.opts, mainOrigin: performance.timeOrigin });
+                         width: s.width, height: s.height, fps: s.fps, main10: s.main10, opts: s.opts, mainOrigin: performance.timeOrigin, replacing: s.replacing });
 }
 
 function _mseWorkerSource() {
@@ -403,6 +413,10 @@ function _mseWorkerMain() {
     postMessage({ type: 'handle', handle: ms.handle }, [ms.handle]);
     setInterval(function () { postMessage({ type: 'stats', stats: s.stats }); _mseResetStats(); }, 250);
     var read = Atomics.load(HEAP32, q), chan = new MessageChannel(), wake = m.opts.wake || 'async', waitMs = m.opts.waitMs || 3;
+    // A player that replaces another one starts in the middle of the stream, where the host sends a
+    // keyframe only on request. The request comes after the queue position is read, because the
+    // worker skips a keyframe that arrived before that.
+    if (m.replacing) _mseRequestIdr('the player was replaced');
     // Diagnostics: how the loop was entered, how long it waited, and gaps in a 5 ms heartbeat
     var diag = s.diag = { via: 'i', since: performance.now(), waited: 0, shift: originShift }, hbLast = performance.now();
     if (m.opts.diag) setInterval(function () {
@@ -467,15 +481,78 @@ function mseStop() {
   _mse = null;
   clearInterval(s.timer);
   clearInterval(s.padTimer);
-  if (s.worker) s.worker.terminate();
+  clearTimeout(s.rebuildTimer);
   if (s.uiPadStopped) Controller.startWatching();
+  _mseDropPlayer(s);
+  console.log('[mse] stopped');
+}
+
+function _mseDropPlayer(s) {
+  if (s.dropped) return;
+  s.dropped = true;
+  s.playing = false;
+  if (s.worker) s.worker.terminate();
   try { s.video.pause(); } catch (e) {}
   s.video.removeAttribute('src');
   s.video.srcObject = null;
   try { s.video.load(); } catch (e) {}
   s.video.remove();
-  console.log('[mse] stopped');
 }
+
+// The new player starts after a pause, because the TV releases the old player in the background. A
+// player created during the release blocks the page for long enough to break the sound. The gamepad
+// timer of the old player runs through the pause, so no input is lost.
+function _mseRebuild() {
+  var s = _mse, a = s.startArgs;
+  clearInterval(s.timer);
+  _mseDropPlayer(s);
+  _mseRenewThreads(_mseHandOverThreads);
+  s.rebuildTimer = setTimeout(function () {
+    mseStart(a[0], a[1], a[2], a[3], a[4], a[5], true);
+    _mseEvent('rebuild');
+  }, 250);
+}
+
+// ---- Threads ----
+// emscripten creates the app's threads when the page loads and reuses them for every stream, so
+// all of them exist at the moment the TV starts to hold back threads (see rebuildAt). From here
+// on the pool hands out only threads created after that moment: the idle ones are replaced at
+// once, and one that is in use is replaced when its work ends.
+var _mseThreadsRenewed = false, _mseThreadsReady = false, _mseThreadsWaiting = [];
+
+function _mseRenewThreads(then) {
+  if (then) _mseThreadsWaiting.push(then);
+  if (_mseThreadsReady) { _mseThreadsWaiting.splice(0).forEach(function (f) { f(); }); return; }
+  if (_mseThreadsRenewed || typeof PThread === 'undefined') return;
+  _mseThreadsRenewed = true;
+  var idle = PThread.unusedWorkers.splice(0), toPool = PThread.returnWorkerToPool;
+  idle.forEach(function (w) { w.terminate(); });
+  PThread.runningWorkers.forEach(function (w) { w.mseOld = true; });
+  PThread.returnWorkerToPool = function (worker) {
+    toPool(worker);
+    if (!worker.mseOld) return;
+    worker.mseOld = false;
+    PThread.unusedWorkers.splice(PThread.unusedWorkers.indexOf(worker), 1);
+    worker.terminate();
+    PThread.allocateUnusedWorkers(1);
+    // The pool hands out its last thread first, and the replacement is still loading
+    PThread.unusedWorkers.unshift(PThread.unusedWorkers.pop());
+  };
+  PThread.allocateUnusedWorkers(idle.length, function () {
+    _mseThreadsReady = true;
+    _mseThreadsWaiting.splice(0).forEach(function (f) { f(); });
+  });
+}
+
+// The stream may still be connecting when its player passes rebuildAt, and the module hands
+// over only once the connection is up, so the request repeats until the module takes it.
+function _mseHandOverThreads(tries) {
+  if (!_mse) return;
+  if (Module._mlRespawnStreamThreads()) { _mseEvent('threads'); return; }
+  if (!(tries >= 20)) setTimeout(_mseHandOverThreads, 250, (tries || 0) + 1);
+}
+
+setTimeout(function () { if (_mseOpts().rebuildAt > 0) _mseRenewThreads(); }, Math.max(0, MSE_DEFAULTS.rebuildAt - performance.now()));
 
 function _mseResetStats() {
   _mse.stats = { since: performance.now(), frames: 0, appended: 0, dropped: 0, idr: 0, resets: 0, seeks: 0, waiting: 0, trims: 0,
@@ -719,6 +796,7 @@ function _mseControl() {
   if (s.lastCtl && tc - s.lastCtl > 30) _mseEvent('mhb', Math.round(tc - s.lastCtl));
   s.lastCtl = tc;
   var v = s.video, o = s.opts;
+  if (s.worker && o.rebuildAt > 0 && s.bornAt < o.rebuildAt && tc >= o.rebuildAt) { _mseRebuild(); return; }
   if (s.worker) s.ctl[0] = v.currentTime;
   else if (!s.sb || !s.sb.buffered.length) return;
   if (s.newest === undefined) return;

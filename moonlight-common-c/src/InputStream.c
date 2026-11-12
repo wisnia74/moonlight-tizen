@@ -726,6 +726,17 @@ int startInputStream(void) {
     return err;
 }
 
+void respawnInputSendThread(void) {
+    // A user wake makes the send thread return, and the queued packets stay for the new thread
+    LbqSignalQueueUserWake(&packetQueue);
+    PltJoinThread(&inputSendThread);
+
+    if (PltCreateThread("InputSend", inputSendThreadProc, NULL, &inputSendThread) != 0) {
+        Limelog("Input Send: failed to create the new thread\n");
+        ListenerCallbacks.connectionTerminated(-1);
+    }
+}
+
 // Stops the input stream
 int stopInputStream(void) {
     // No more packets should be queued now

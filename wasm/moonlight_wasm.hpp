@@ -127,6 +127,7 @@ class MoonlightInstance {
 
   void HandleGamepadInputState(bool rumbleFeedback, bool mouseEmulation, bool flipABfaceButtons, bool flipXYfaceButtons);
   void PollGamepads();
+  int RespawnStreamThreads();
 
   void MouseLockLost();
   void DidLockMouse(int32_t result);
@@ -149,6 +150,7 @@ class MoonlightInstance {
   static void* ConnectionThreadFunc(void* context);
   static void* InputThreadFunc(void* context);
   static void* StopThreadFunc(void* context);
+  static void* RespawnThreadFunc(void* context);
 
   static void ClStageStarting(int stage);
   static void ClStageFailed(int stage, int errorCode);
@@ -286,6 +288,7 @@ class MoonlightInstance {
   std::atomic<bool> m_VideoStarted;
   std::atomic<bool> m_ConnectionCancelled;
   pthread_t m_StopThread;
+  pthread_t m_RespawnThread;
   std::atomic<samsung::wasm::SessionId> m_AudioSessionId;
   std::atomic<samsung::wasm::SessionId> m_VideoSessionId;
   samsung::html::HTMLMediaElement m_MediaElement;

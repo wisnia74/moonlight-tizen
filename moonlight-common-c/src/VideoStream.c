@@ -276,6 +276,16 @@ int readFirstFrame(void) {
     return 0;
 }
 
+void respawnVideoReceiveThread(void) {
+    PltInterruptThread(&receiveThread);
+    PltJoinThread(&receiveThread);
+
+    if (PltCreateThread("VideoRecv", VideoReceiveThreadProc, NULL, &receiveThread) != 0) {
+        Limelog("Video Receive: failed to create the new thread\n");
+        ListenerCallbacks.connectionTerminated(-1);
+    }
+}
+
 // Terminate the video stream
 void stopVideoStream(void) {
     if (!receivedDataFromPeer) {

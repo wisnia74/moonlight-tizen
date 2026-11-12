@@ -140,14 +140,17 @@ void destroyVideoStream(void);
 void notifyKeyFrameReceived(void);
 int startVideoStream(void* rendererContext, int drFlags);
 void stopVideoStream(void);
+void respawnVideoReceiveThread(void);
 
 int initializeAudioStream(void);
 int notifyAudioPortNegotiationComplete(void);
 void destroyAudioStream(void);
 int startAudioStream(void* audioContext, int arFlags);
 void stopAudioStream(void);
+void respawnAudioReceiveThread(void);
 
 int initializeInputStream(void);
 void destroyInputStream(void);
 int startInputStream(void);
 int stopInputStream(void);
+void respawnInputSendThread(void);

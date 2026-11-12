@@ -547,6 +547,12 @@ void LiStopConnection(void);
 // so it is not safe to start another connection before the first LiStartConnection() call returns.
 void LiInterruptConnection(void);
 
+// This function moves the video receive, audio receive and input send loops to new threads
+// while the stream runs. The sockets and queues stay, so the stream goes on without a
+// reconnect. It exists for platforms that slow down long-lived threads. It may only be called
+// between LiStartConnection() and LiStopConnection(), and never while either of them runs.
+void LiRespawnStreamThreads(void);
+
 // Use to get a user-visible string to display initialization progress
 // from the integer passed to the ConnListenerStageXXX callbacks
 const char* LiGetStageName(int stage);

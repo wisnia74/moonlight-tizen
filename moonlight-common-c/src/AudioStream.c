@@ -245,7 +245,8 @@ static void AudioReceiveThreadProc(void* context) {
     int waitingForAudioMs;
 
     packet = NULL;
-    packetsToDrop = 500 / AudioPacketDuration;
+    // A thread that takes over a running stream must not drop audio a second time
+    packetsToDrop = receivedDataFromPeer ? 0 : 500 / AudioPacketDuration;
 
     if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
         // SO_RCVTIMEO failed, so use select() to wait
@@ -394,6 +395,16 @@ static void AudioDecoderThreadProc(void* context) {
         decodeInputData(packet);
 
         free(packet);
+    }
+}
+
+void respawnAudioReceiveThread(void) {
+    PltInterruptThread(&receiveThread);
+    PltJoinThread(&receiveThread);
+
+    if (PltCreateThread("AudioRecv", AudioReceiveThreadProc, NULL, &receiveThread) != 0) {
+        Limelog("Audio Receive: failed to create the new thread\n");
+        ListenerCallbacks.connectionTerminated(-1);
     }
 }
 

@@ -65,6 +65,16 @@ void LiInterruptConnection(void) {
     ConnectionInterrupted = true;
 }
 
+void LiRespawnStreamThreads(void) {
+    if (stage != STAGE_INPUT_STREAM_START) {
+        return;
+    }
+
+    respawnVideoReceiveThread();
+    respawnAudioReceiveThread();
+    respawnInputSendThread();
+}
+
 // Stop the connection by undoing the step at the current stage and those before it
 void LiStopConnection(void) {
     // Disable termination callbacks now

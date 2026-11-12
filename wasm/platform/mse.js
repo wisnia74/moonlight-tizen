@@ -45,7 +45,7 @@
 // The backend polls the gamepads from a 4 ms timer on the main thread instead of Moonlight's input
 // thread, whose every gamepad call waits for the main thread.
 var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 30,
-                     startAhead: 20, idrMB: 50, sceneMB: 8, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'async', waitMs: 3, reuse: true, uiPad: false };
+                     startAhead: 20, idrMB: 50, sceneMB: 8, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'async', waitMs: 3, reuse: true, uiPad: false, trimSlice: 0, trimGap: 50, diag: false };
 var MSE_TIMESCALE = 90000;
 // Kept across a hot reload, so a running stream's video element is not orphaned over the UI
 var _mse = window._mse || null;
@@ -391,7 +391,7 @@ function _mseWorkerMain() {
     var read = Atomics.load(HEAP32, q), chan = new MessageChannel(), wake = m.opts.wake || 'async', waitMs = m.opts.waitMs || 3;
     // Diagnostics: how the loop was entered, how long it waited, and gaps in a 5 ms heartbeat
     var diag = s.diag = { via: 'i', since: performance.now(), waited: 0, shift: originShift }, hbLast = performance.now();
-    setInterval(function () {
+    if (m.opts.diag) setInterval(function () {
       var n = performance.now(), d = n - hbLast;
       hbLast = n;
       if (d > 20) _mseEvent('whb', [Math.round(d), Math.round(n - d - originShift)]);
@@ -414,10 +414,20 @@ function _mseWorkerMain() {
       if (wake === 'spin') { chan.port2.postMessage('s'); return; }
       if (wake === 'timer') { setTimeout(loop, 1, 't'); return; }
       if (wake === 'wait') { Atomics.wait(HEAP32, q, read, waitMs); chan.port2.postMessage('b'); return; }
+      if (wake === 'block') {
+        if (!s.open || !s.sb) { Atomics.wait(HEAP32, q, read, waitMs); chan.port2.postMessage('b'); return; }
+        // An append or trim is in flight: its updateend can only run from the event loop, and its
+        // handler re-enters here
+        if (s.sb.updating) return;
+        Atomics.wait(HEAP32, q, read, 20);
+        chan.port2.postMessage('b');
+        return;
+      }
       var r = Atomics.waitAsync(HEAP32, q, read);
       if (r.async) r.value.then(onWake); else chan.port2.postMessage('c');
     }
     chan.port1.onmessage = function (e) { loop(e.data); };
+    if (wake === 'block') s.afterUpdate = function () { loop('u'); };
     loop('i');
   };
 }
@@ -474,7 +484,7 @@ function _mseReceiveFrame(ptr, len, idr, frameNumber, ptsMs, recvMs, reasmMs, qu
   var now = performance.now();
   s.stats.frames++;
   if (s.lastRecvAt !== undefined && now - s.lastRecvAt > 20) _mseEvent('agap', [Math.round(now - s.lastRecvAt), Math.round(recvMs - s.lastRecvMs), ptsMs - s.lastPtsMs]);
-  if (s.lastPtsMs !== undefined && ptsMs - s.lastPtsMs > 13) _mseEvent('pgap', ptsMs - s.lastPtsMs);
+  if (s.opts.diag && s.lastPtsMs !== undefined && ptsMs - s.lastPtsMs > 13) _mseEvent('pgap', ptsMs - s.lastPtsMs);
   s.lastRecvAt = now; s.lastPtsMs = ptsMs; s.lastRecvMs = recvMs;
   var lag = now - recvMs, dg = s.diag;
   s.stats.lag.push(lag);
@@ -591,11 +601,13 @@ function _msePump() {
     s.sb.mode = 'segments';
     s.sb.addEventListener('updateend', function () {
       var t0 = performance.now();
+      if (s.rmAt) { _mseEvent('rm', Math.round((t0 - s.rmAt) * 10) / 10); s.rmAt = 0; }
       if (_mse === s && s.appendAt !== null) { s.stats.appendMs.push(t0 - s.appendAt); s.appendAt = null; }
       if (s.ctl && s.sb.buffered.length) s.ctl[2] = s.sb.buffered.start(0);
       _mseTask('buf', t0);
       _msePump();
       _mseTask('upd', t0);
+      if (s.afterUpdate) s.afterUpdate();
     });
     s.sb.addEventListener('error', function () { if (_mse === s) _mseRequestIdr('source buffer error'); });
   }
@@ -603,17 +615,35 @@ function _msePump() {
   var now = performance.now();
   var v = s.video;
   // remove() also drops every frame up to the next keyframe, and the stream has keyframes only
-  // where one was requested, so the buffer is trimmed only up to a keyframe behind playback
-  if (now - s.lastTrim > 1000 && s.sb.buffered.length) {
+  // where one was requested, so the buffer is trimmed only up to a keyframe behind playback.
+  // Freeing a whole stretch between keyframes at once stalls this thread for tens of ms, so it
+  // goes in slices of trimSlice seconds, working back from that keyframe.
+  if (s.trimEnd !== undefined && s.trimEnd !== null) {
+    // A trim in progress: one slice per trimGap ms, newest first, so each remove() frees little
+    if (now - s.lastTrim >= s.opts.trimGap && s.sb.buffered.length) {
+      s.lastTrim = now;
+      var from = Math.max(s.sb.buffered.start(0), s.trimEnd - s.opts.trimSlice);
+      if (s.trimEnd - from < 0.004) s.trimEnd = null;
+      else {
+        s.rmAt = performance.now();
+        s.sb.remove(from, s.trimEnd);
+        s.trimEnd = from - s.sb.buffered.start(0) < 0.004 ? null : from;
+        return;
+      }
+    }
+  } else if (now - s.lastTrim > 1000 && s.sb.buffered.length) {
     s.lastTrim = now;
     var cut = null;
     while (s.keyTimes.length > 1 && s.keyTimes[1] < v.currentTime - 0.5) cut = s.keyTimes.shift();
     if (cut !== null && s.keyTimes[0] > s.sb.buffered.start(0) + 0.1) {
       s.stats.trims++;
       _mseEvent('trim', Math.round(s.keyTimes[0] * 1000));
-      var tr = performance.now();
-      s.sb.remove(0, s.keyTimes[0] - 0.001);
-      _mseTask('rm', tr);
+      s.rmAt = performance.now();
+      if (s.opts.trimSlice > 0) {
+        var first = Math.max(s.sb.buffered.start(0), s.keyTimes[0] - s.opts.trimSlice);
+        s.sb.remove(first, s.keyTimes[0] - 0.001);
+        s.trimEnd = first - s.sb.buffered.start(0) < 0.004 ? null : first;
+      } else s.sb.remove(0, s.keyTimes[0] - 0.001);
       return;
     }
   }
@@ -692,10 +722,10 @@ function _mseControl() {
   }
   var gauge = ahead;
   if (o.rateWindow > 0) {
-    var hist = s.aheadHist || (s.aheadHist = []);
-    hist.push([nowMs, ahead]);
-    while (hist.length && hist[0][0] < nowMs - o.rateWindow) hist.shift();
-    gauge = Math.min.apply(null, hist.map(function (h) { return h[1]; }));
+    var ht = s.histT || (s.histT = []), hv = s.histV || (s.histV = []);
+    ht.push(nowMs); hv.push(ahead);
+    while (ht.length && ht[0] < nowMs - o.rateWindow) { ht.shift(); hv.shift(); }
+    for (var hi = 0; hi < hv.length; hi++) if (hv[hi] < gauge) gauge = hv[hi];
   }
   var until = o.rateUntil === undefined || o.rateUntil === null ? o.rateAbove : o.rateUntil;
   var rate = gauge > o.rateAbove || (s.appliedRate === o.rateHi && o.rateHi !== 1 && gauge > until) ? o.rateHi : gauge < o.rateBelow ? o.rateLo : 1.0;

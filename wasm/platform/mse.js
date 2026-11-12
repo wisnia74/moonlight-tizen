@@ -45,7 +45,7 @@
 // The backend polls the gamepads from a 4 ms timer on the main thread instead of Moonlight's input
 // thread, whose every gamepad call waits for the main thread.
 var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 30,
-                     startAhead: 20, idrMB: 50, sceneMB: 8, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'async', waitMs: 3, reuse: true, uiPad: false, trimSlice: 0, trimGap: 50, diag: false };
+                     startAhead: 20, idrMB: 50, sceneMB: 8, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'block', waitMs: 3, reuse: true, uiPad: false, trimSlice: 1, trimGap: 50, diag: false, floorFrames: 4, margin: 12, marginHi: 37, gridPhase: true };
 var MSE_TIMESCALE = 90000;
 // Kept across a hot reload, so a running stream's video element is not orphaned over the UI
 var _mse = window._mse || null;
@@ -323,7 +323,8 @@ function mseStart(videoFormat, width, height, fps, needIdrAddr, queueAddr) {
 // The worker runs the same receive, mux and pump functions as the main thread; their source is
 // copied into it. Shared with the main thread through s.ctl (Float64Array on a SharedArrayBuffer):
 // [0] currentTime (main writes), [1] newest appended frame time, [2] buffered start (worker
-// writes), [3] 1 while the main thread wants a seek to the next keyframe, [4] that keyframe's time.
+// writes), [3] 1 while the main thread wants a seek to the next keyframe, [4] that keyframe's time,
+// [5] the recent interval between frames in ms (worker writes).
 
 function _mseShareCtl(s, ctl) {
   s.ctl = ctl;
@@ -332,8 +333,8 @@ function _mseShareCtl(s, ctl) {
 }
 
 function _mseStartWorker(s, queueAddr) {
-  var ctl = new Float64Array(new SharedArrayBuffer(40));
-  ctl[0] = 0; ctl[1] = NaN; ctl[2] = NaN; ctl[3] = 0; ctl[4] = NaN;
+  var ctl = new Float64Array(new SharedArrayBuffer(48));
+  ctl[0] = 0; ctl[1] = NaN; ctl[2] = NaN; ctl[3] = 0; ctl[4] = NaN; ctl[5] = 0;
   _mseShareCtl(s, ctl);
   Object.defineProperty(s, 'newest', { get: function () { return ctl[1] >= 0 ? ctl[1] : undefined; }, set: function () {} });
   var url = URL.createObjectURL(new Blob([_mseWorkerSource()], { type: 'text/javascript' }));
@@ -348,6 +349,7 @@ function _mseStartWorker(s, queueAddr) {
       _mseEvent(m.kind, m.info);
     } else if (m.type === 'stats') {
       ['frames', 'appended', 'dropped', 'idr', 'resets', 'trims', 'bytes'].forEach(function (k) { st[k] += m.stats[k]; });
+      for (k = 0; k < 10; k++) st.steps[k] += m.stats.steps[k];
       // Nothing reads these unless the inspector asks for a summary, so they start over before they grow large
       if (st.lag.length > 30000) _mseResetStats();
       ['recvToAppend', 'muxMs', 'appendMs', 'sizes', 'lag', 'reasm', 'cq'].forEach(function (k) { Array.prototype.push.apply(st[k], m.stats[k]); });
@@ -467,7 +469,7 @@ function mseStop() {
 
 function _mseResetStats() {
   _mse.stats = { since: performance.now(), frames: 0, appended: 0, dropped: 0, idr: 0, resets: 0, seeks: 0, waiting: 0, trims: 0,
-                 rateMs: 0, ahead: [], recvToAppend: [], muxMs: [], appendMs: [], sizes: [], lag: [], reasm: [], cq: [], bytes: 0, q0: _mse.video.getVideoPlaybackQuality ? _mse.video.getVideoPlaybackQuality() : null };
+                 rateMs: 0, ahead: [], recvToAppend: [], muxMs: [], appendMs: [], sizes: [], lag: [], reasm: [], cq: [], steps: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bytes: 0, q0: _mse.video.getVideoPlaybackQuality ? _mse.video.getVideoPlaybackQuality() : null };
 }
 
 function _mseRequestIdr(reason) {
@@ -487,6 +489,11 @@ function _mseReceiveFrame(ptr, len, idr, frameNumber, ptsMs, recvMs, reasmMs, qu
   s.stats.frames++;
   if (s.lastRecvAt !== undefined && now - s.lastRecvAt > 20) _mseEvent('agap', [Math.round(now - s.lastRecvAt), Math.round(recvMs - s.lastRecvMs), ptsMs - s.lastPtsMs]);
   if (s.opts.diag && s.lastPtsMs !== undefined && ptsMs - s.lastPtsMs > 13) _mseEvent('pgap', ptsMs - s.lastPtsMs);
+  if (s.lastPtsMs !== undefined) {
+    var gap = Math.min(50, Math.max(4, ptsMs - s.lastPtsMs));
+    s.cadence = s.cadence ? s.cadence * 0.95 + gap * 0.05 : gap;
+    if (s.ctl) s.ctl[5] = s.cadence;
+  }
   s.lastRecvAt = now; s.lastPtsMs = ptsMs; s.lastRecvMs = recvMs;
   var lag = now - recvMs, dg = s.diag;
   s.stats.lag.push(lag);
@@ -559,8 +566,22 @@ function _mseReceiveFrame(ptr, len, idr, frameNumber, ptsMs, recvMs, reasmMs, qu
     t = Math.round((now - s.t0) * MSE_TIMESCALE / 1000);
   } else if (s.opts.pts === 'grid') {
     if (s.firstPts === null) s.firstPts = ptsMs;
-    var slot = Math.round((ptsMs - s.firstPts) * (s.fps || 120) / 1000);
-    if (s.lastSlot !== undefined && slot <= s.lastSlot) slot = s.lastSlot + 1;
+    var pos = (ptsMs - s.firstPts) * (s.fps || 120) / 1000 + (s.gridShift || 0);
+    var slot = Math.round(pos);
+    if (s.opts.gridPhase) {
+      // Frames whose timestamps sit near the edge of a slot fall to either side of it from one
+      // frame to the next, which shows as judder. Moving the grid by half a slot centres them.
+      s.gridOff = (s.gridOff === undefined ? 0.25 : s.gridOff) * 0.97 + Math.abs(pos - slot) * 0.03;
+      s.gridAge = (s.gridAge || 0) + 1;
+      if (s.gridOff > 0.32 && s.gridAge > 120) {
+        s.gridShift = (s.gridShift || 0) + 0.5;
+        s.gridOff = 0.25; s.gridAge = 0;
+        _mseEvent('gridShift', Math.round(pos * 100) / 100);
+      }
+    }
+    var bumped = s.lastSlot !== undefined && slot <= s.lastSlot;
+    if (bumped) slot = s.lastSlot + 1;
+    if (s.lastSlot !== undefined) { var step = bumped ? 0 : Math.min(9, slot - s.lastSlot); s.stats.steps[step]++; }
     s.lastSlot = slot;
     t = Math.round(slot * MSE_TIMESCALE / (s.fps || 120));
   } else {
@@ -729,8 +750,11 @@ function _mseControl() {
     while (ht.length && ht[0] < nowMs - o.rateWindow) { ht.shift(); hv.shift(); }
     for (var hi = 0; hi < hv.length; hi++) if (hv[hi] < gauge) gauge = hv[hi];
   }
-  var until = o.rateUntil === undefined || o.rateUntil === null ? o.rateAbove : o.rateUntil;
-  var rate = gauge > o.rateAbove || (s.appliedRate === o.rateHi && o.rateHi !== 1 && gauge > until) ? o.rateHi : gauge < o.rateBelow ? o.rateLo : 1.0;
+  var until = o.rateUntil === undefined || o.rateUntil === null ? o.rateAbove : o.rateUntil, above = o.rateAbove;
+  var cadence = s.worker ? s.ctl[5] : s.cadence;
+  if (o.floorFrames > 0 && cadence > 0) { until = o.floorFrames * cadence + o.margin; above = o.floorFrames * cadence + o.marginHi; }
+  s.floorMs = o.floorFrames > 0 && cadence > 0 ? o.floorFrames * cadence : null;
+  var rate = gauge > above || (s.appliedRate === o.rateHi && o.rateHi !== 1 && gauge > until) ? o.rateHi : gauge < o.rateBelow ? o.rateLo : 1.0;
   if ((s.appliedRate === undefined ? 1 : s.appliedRate) !== rate && nowMs - (s.lastRateAt || 0) >= o.rateHold) { v.playbackRate = rate; s.appliedRate = rate; s.lastRateAt = nowMs; _mseEvent('rate', rate); }
   if (rate !== 1.0) s.stats.rateMs += 10;
 }
@@ -755,6 +779,8 @@ function mseSummary(reset) {
     dropped: st.dropped, idr: st.idr, resets: st.resets, seeks: st.seeks, waiting: st.waiting, trims: st.trims,
     bufferedSec: s.sb && s.sb.buffered.length ? Math.round((s.sb.buffered.end(s.sb.buffered.length - 1) - s.sb.buffered.start(0)) * 10) / 10 : 0,
     catchUpPct: Math.round(st.rateMs / 10 / secs),
+    steps: st.steps,
+    floorMs: s.floorMs ? Math.round(s.floorMs * 10) / 10 : null,
     aheadMs: { p10: _msePct(st.ahead, 0.1), p50: _msePct(st.ahead, 0.5), p90: _msePct(st.ahead, 0.9), max: _msePct(st.ahead, 1) },
     lagMs: { p50: _msePct(st.lag, 0.5), p90: _msePct(st.lag, 0.9), p99: _msePct(st.lag, 0.99), max: _msePct(st.lag, 1) },
     reasmMs: { p50: _msePct(st.reasm, 0.5), p90: _msePct(st.reasm, 0.9), p99: _msePct(st.reasm, 0.99), max: _msePct(st.reasm, 1) },

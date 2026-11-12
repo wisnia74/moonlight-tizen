@@ -2955,7 +2955,8 @@ function startGame(host, appID) {
       '\n Performance statistics: ' + performanceStats);
 
       // Hide on-screen overlays until the streaming session begins
-      $('#connection-warnings, #performance-stats').css('background', 'transparent').text('');
+      $('#connection-warnings').css('background', 'transparent').text('');
+      drawPerformanceStats('');
 
       // Shows a loading message to launch the application and start stream mode
       $('#loadingSpinnerMessage').text(t('Starting %1$s...', appToStart.title));

@@ -147,6 +147,42 @@ function translateBackendMessage(text) {
   return translated;
 }
 
+// Draw the performance statistics on the canvas of the overlay, or clear it for an empty text.
+// The statistics change once a second. As text of the page, every change is laid out again and
+// rasterized in tiles on the raster threads, and on this TV that work delays the packets of the
+// stream. On a canvas the same change is one small texture. The box behind the text is drawn
+// here too, because a canvas with a CSS background is painted into the tiles of the page again.
+function drawPerformanceStats(text) {
+  const canvas = document.getElementById('performance-stats');
+  const context = canvas.getContext('2d');
+  const padding = 8;
+
+  canvas.statsText = text;
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  if (!text) {
+    return;
+  }
+
+  context.fillStyle = 'rgba(0, 0, 0, 0.5)';
+  context.beginPath();
+  context.roundRect(0, 0, canvas.width, canvas.height, padding);
+  context.fill();
+
+  // The TV writes computed lengths with a decimal comma, which neither parseFloat() nor the
+  // font of a canvas accepts
+  const style = getComputedStyle(canvas);
+  const fontSize = parseFloat(style.fontSize.replace(',', '.'));
+  const lineHeight = parseFloat(style.lineHeight.replace(',', '.'));
+
+  context.font = style.fontWeight + ' ' + fontSize + 'px ' + style.fontFamily;
+  context.fillStyle = style.color;
+  context.textBaseline = 'top';
+  const lines = text.split('\n');
+  for (let line = 0; line < lines.length; line++) {
+    context.fillText(lines[line], padding, padding + line * lineHeight + (lineHeight - fontSize) / 2);
+  }
+}
+
 /**
  * var sendMessage - Sends a message with arguments to the Wasm module
  *
@@ -391,8 +427,7 @@ function handleMessage(msg) {
       $('#performance-stats').css('display', 'none');
     }
     // Hide the performance statistics overlay
-    $('#performance-stats').css('background', 'transparent');
-    $('#performance-stats').text('');
+    drawPerformanceStats('');
   } else if (msg.indexOf('StatMsg: ') === 0) {
     // Toggle the performance stats switch and save the state
     if (!$('#performanceStatsSwitch').prop('checked')) {
@@ -401,8 +436,7 @@ function handleMessage(msg) {
       $('#performance-stats').css('display', 'inline-block');
     }
     // Show the performance statistics overlay
-    $('#performance-stats').css('background', 'rgba(0, 0, 0, 0.5)');
-    $('#performance-stats').text(translateBackendMessage(msg.replace('StatMsg: ', '')));
+    drawPerformanceStats(translateBackendMessage(msg.replace('StatMsg: ', '')));
   } else if (msg.indexOf('controllerRumble: ') === 0) {
     const eventData = msg.split(' ')[1].split(',');
     const gamepadIdx = parseInt(eventData[0]);

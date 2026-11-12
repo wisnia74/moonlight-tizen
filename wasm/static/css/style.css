@@ -739,23 +739,15 @@ body {
 }
 #performance-stats {
     color: #fff;
-    background: transparent;
     position: absolute;
     top: 10px;
     left: 10px;
     z-index: 3;
-    padding: 8px;
-    border-radius: 8px;
     font-size: 1.65rem;
     font-weight: 500;
     line-height: 1.2;
-    white-space: pre-wrap;
     width: 720px;
     height: 340px;
-    box-sizing: border-box;
-    overflow: hidden;
-    contain: strict;
-    will-change: transform;
 }
 /* =============================
    Settings Section

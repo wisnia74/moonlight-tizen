@@ -10,7 +10,10 @@
 //   rateAbove:  play at rateHi while more than this is buffered ahead of playback
 //   rateHi:     catch-up playback rate
 //   seekAbove:  jump to the live edge when more than this is buffered ahead
-//   seekTarget: how much to leave buffered after such a jump
+//   seekTarget: how much to leave buffered after such a jump. With less, the buffer settles at the
+//               player's floor after the jump, where playback pauses.
+//   startSeekAbove: seekAbove for the first jump of a stream, which removes the video that arrived
+//               while the TV's player was starting
 //   startAhead: buffered time needed before playback starts
 //   idrMB:      ask the host for a keyframe once this many MB of video have arrived since the last
 //               one. The buffer can be trimmed only at a keyframe, and the TV's player refuses
@@ -63,7 +66,7 @@
 //                through its task queue), 'timer' (setTimeout 1), 'wait' (Atomics.wait up to waitMs, then yield)
 // The backend polls the gamepads from a 4 ms timer on the main thread instead of Moonlight's input
 // thread, whose every gamepad call waits for the main thread.
-var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 30,
+var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 60, startSeekAbove: 150,
                      startAhead: 20, idrMB: 50, sceneMB: 30, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'block', waitMs: 3, reuse: true, uiPad: false, trimSlice: 1, trimGap: 50, diag: false, floorFrames: 4, margin: 12, marginHi: 37, marginLo: 10, marginMid: 18, rebuildAt: 63000, gridPhase: true };
 var MSE_TIMESCALE = 90000;
 // Kept across a hot reload, so a running stream's video element is not orphaned over the UI
@@ -310,7 +313,7 @@ function mseStart(videoFormat, width, height, fps, needIdrAddr, queueAddr, repla
     live: startOpts.live, mux: startOpts.mux, appendAt: null,
     needIdrAddr: needIdrAddr, waitIdr: true, params: null, seq: 1, firstPts: null, t0: null,
     pending: [], open: false, playing: false, timer: null, lastTrim: 0, keyTimes: [],
-    stats: null, events: [], lastCt: -1, lastCtAt: 0, stalled: false,
+    stats: null, events: [], lastCt: -1, lastCtAt: 0, stalled: false, startup: 'waiting',
     bornAt: performance.now(), startArgs: [videoFormat, width, height, fps, needIdrAddr, queueAddr], replacing: !!replacing,
   };
   _mseResetStats();
@@ -789,6 +792,16 @@ function _mseTask(kind, t0) {
   if (d > 6) _mseEvent('wtask', [kind, Math.round(d * 10) / 10, Math.round(t0 - (_mse && _mse.diag ? _mse.diag.shift : 0))]);
 }
 
+// True when the buffered range that holds the playback position ends before the newest frame by
+// more than MSE's limit for a timestamp gap, which is twice the declared frame duration.
+function _mseHoleAhead(s, newest) {
+  var b = s.video.buffered, at = s.video.currentTime;
+  for (var i = 0; i < b.length; i++) {
+    if (b.start(i) - 0.001 <= at && at <= b.end(i)) return newest - b.end(i) > 2 * s.opts.durMs / 1000;
+  }
+  return false;
+}
+
 function _mseControl() {
   var s = _mse;
   if (!s) return;
@@ -806,6 +819,8 @@ function _mseControl() {
     if (ahead >= o.startAhead) {
       s.playing = true;
       if (start >= 0 && v.currentTime < start) v.currentTime = start;
+      s.ranFrom = Math.max(v.currentTime, start);
+      s.playAt = tc;
       v.play().catch(function (e) { console.error('[mse] play failed: ' + e); });
     }
     return;
@@ -820,17 +835,36 @@ function _mseControl() {
     s.lastCtAt = nowMs;
   } else if (!s.stalled && nowMs - s.lastCtAt > 60) {
     s.stalled = true;
+    s.ranFrom = v.currentTime;
     _mseEvent('stall');
   }
+  // The TV's player needs most of a second to start, and a jump before its clock runs makes it
+  // start again. The first jump therefore waits until the clock has run for 100 ms without a stop.
+  // A player that is stuck gets its jump at once, because its clock never runs without one. It is
+  // stuck behind a hole after the first frames: MSE drops every frame after a timestamp gap up to
+  // the next keyframe, and a still picture at the start of a stream leaves such a gap. A player
+  // that has not started 1.5 s after play() for any other reason counts as stuck too. That jump
+  // only gets the player across, so the wait for its clock starts again after it.
+  if (s.startup === 'waiting') {
+    if (v.currentTime - s.ranFrom >= 0.1) s.startup = 'backlog';
+    else if (_mseHoleAhead(s, end) || nowMs - s.playAt > 1500) s.startup = 'stuck';
+  }
+  var seekAbove = { waiting: Infinity, stuck: 0, backlog: o.startSeekAbove, done: o.seekAbove }[s.startup];
+  var seekPending = s.seekWanted || (s.seekTo !== null && s.seekTo !== undefined);
   // A seek decodes forward from the keyframe before the target, so it jumps only onto a keyframe
   if (s.seekTo !== null && s.seekTo !== undefined && end >= s.seekTo + o.seekTarget / 1000) {
     _mseEvent('seek', Math.round(s.seekTo * 1000));
     v.currentTime = s.seekTo;
+    s.ranFrom = s.seekTo;
+    s.playAt = nowMs;
     s.seekTo = null;
     s.stats.seeks++;
-  } else if (ahead > o.seekAbove && !s.seekWanted && (s.seekTo === null || s.seekTo === undefined)) {
+    s.startup = s.startup === 'stuck' ? 'waiting' : 'done';
+  } else if (ahead > seekAbove && !seekPending) {
     s.seekWanted = true;
     Atomics.store(HEAP32, s.needIdrAddr >> 2, 2);
+  } else if (s.startup === 'backlog' && !seekPending) {
+    s.startup = 'done';
   }
   var gauge = ahead;
   if (o.rateWindow > 0) {

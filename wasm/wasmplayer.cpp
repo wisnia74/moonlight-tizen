@@ -612,6 +612,8 @@ int MoonlightInstance::VidDecSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
       slot[3] = (int32_t)decodeUnit->frameNumber;
       slot[4] = (int32_t)decodeUnit->presentationTimeMs;
       slot[5] = (int32_t)decodeUnit->receiveTimeMs;
+      slot[6] = (int32_t)decodeUnit->enqueueTimeMs;
+      slot[7] = (int32_t)LiGetMillis();
       __atomic_store_n(&s_MseQueue[0], n + 1, __ATOMIC_SEQ_CST);
       EM_ASM({ Atomics.notify(HEAP32, $0 >> 2, 1); }, (int)(size_t)&s_MseQueue[0]);
     } else {

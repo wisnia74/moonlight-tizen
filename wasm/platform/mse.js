@@ -348,7 +348,7 @@ function _mseStartWorker(s, queueAddr) {
       _mseEvent(m.kind, m.info);
     } else if (m.type === 'stats') {
       ['frames', 'appended', 'dropped', 'idr', 'resets', 'trims', 'bytes'].forEach(function (k) { st[k] += m.stats[k]; });
-      ['recvToAppend', 'muxMs', 'appendMs', 'sizes', 'lag'].forEach(function (k) { Array.prototype.push.apply(st[k], m.stats[k]); });
+      ['recvToAppend', 'muxMs', 'appendMs', 'sizes', 'lag', 'reasm', 'cq'].forEach(function (k) { Array.prototype.push.apply(st[k], m.stats[k]); });
     }
   };
   s.worker.postMessage({ type: 'init', buffer: HEAPU8.buffer, ctl: ctl.buffer, queueAddr: queueAddr, needIdrAddr: s.needIdrAddr,
@@ -404,7 +404,7 @@ function _mseWorkerMain() {
       if (w - read > SLOTS) { _mseRequestIdr('worker fell ' + (w - read) + ' frames behind'); read = w; }
       while (read !== w) {
         var b = q + 1 + (read % SLOTS) * SLOT_INTS;
-        _mseReceiveFrame(HEAP32[b], HEAP32[b + 1], HEAP32[b + 2], HEAP32[b + 3], HEAP32[b + 4], HEAP32[b + 5] + originShift);
+        _mseReceiveFrame(HEAP32[b], HEAP32[b + 1], HEAP32[b + 2], HEAP32[b + 3], HEAP32[b + 4], HEAP32[b + 5] + originShift, HEAP32[b + 6] - HEAP32[b + 5], HEAP32[b + 7] - HEAP32[b + 6]);
         read++;
       }
       _mseTask('loop', t0);
@@ -455,7 +455,7 @@ function mseStop() {
 
 function _mseResetStats() {
   _mse.stats = { since: performance.now(), frames: 0, appended: 0, dropped: 0, idr: 0, resets: 0, seeks: 0, waiting: 0, trims: 0,
-                 rateMs: 0, ahead: [], recvToAppend: [], muxMs: [], appendMs: [], sizes: [], lag: [], bytes: 0, q0: _mse.video.getVideoPlaybackQuality ? _mse.video.getVideoPlaybackQuality() : null };
+                 rateMs: 0, ahead: [], recvToAppend: [], muxMs: [], appendMs: [], sizes: [], lag: [], reasm: [], cq: [], bytes: 0, q0: _mse.video.getVideoPlaybackQuality ? _mse.video.getVideoPlaybackQuality() : null };
 }
 
 function _mseRequestIdr(reason) {
@@ -468,7 +468,7 @@ function _mseRequestIdr(reason) {
   Atomics.store(HEAP32, s.needIdrAddr >> 2, 1);
 }
 
-function _mseReceiveFrame(ptr, len, idr, frameNumber, ptsMs, recvMs) {
+function _mseReceiveFrame(ptr, len, idr, frameNumber, ptsMs, recvMs, reasmMs, queueMs) {
   var s = _mse;
   if (!s) return;
   var now = performance.now();
@@ -478,7 +478,8 @@ function _mseReceiveFrame(ptr, len, idr, frameNumber, ptsMs, recvMs) {
   s.lastRecvAt = now; s.lastPtsMs = ptsMs; s.lastRecvMs = recvMs;
   var lag = now - recvMs, dg = s.diag;
   s.stats.lag.push(lag);
-  if (lag > 20) _mseEvent('wlate', [Math.round(lag), dg ? dg.via : 'm', dg ? Math.round(dg.waited) : null, Math.round(now - (dg ? dg.shift : 0))]);
+  if (reasmMs !== undefined) { s.stats.reasm.push(reasmMs); s.stats.cq.push(queueMs); }
+  if (lag > 20) _mseEvent('wlate', [Math.round(lag), dg ? dg.via : 'm', dg ? Math.round(dg.waited) : null, Math.round(now - (dg ? dg.shift : 0)), reasmMs, queueMs]);
   if (frameNumber % 120 === 0) _mseEvent('clk', [ptsMs, Math.round(recvMs * 10) / 10, Math.round(now * 10) / 10]);
   var dd = HEAPU8.subarray(ptr, ptr + len), payload = 0, nalStart = -1, nalType = 0;
   for (var q = 0; q + 3 < len; q++) {
@@ -724,6 +725,8 @@ function mseSummary(reset) {
     catchUpPct: Math.round(st.rateMs / 10 / secs),
     aheadMs: { p10: _msePct(st.ahead, 0.1), p50: _msePct(st.ahead, 0.5), p90: _msePct(st.ahead, 0.9), max: _msePct(st.ahead, 1) },
     lagMs: { p50: _msePct(st.lag, 0.5), p90: _msePct(st.lag, 0.9), p99: _msePct(st.lag, 0.99), max: _msePct(st.lag, 1) },
+    reasmMs: { p50: _msePct(st.reasm, 0.5), p90: _msePct(st.reasm, 0.9), p99: _msePct(st.reasm, 0.99), max: _msePct(st.reasm, 1) },
+    queueMs: { p50: _msePct(st.cq, 0.5), p90: _msePct(st.cq, 0.9), p99: _msePct(st.cq, 0.99), max: _msePct(st.cq, 1) },
     recvToAppendMs: { p50: _msePct(st.recvToAppend, 0.5), p90: _msePct(st.recvToAppend, 0.9) },
     sizes: (function () { var a = st.sizes.slice().sort(function (x, y) { return x - y; }), med = a[a.length >> 1] || 0; return { n: a.length, p10: a[Math.floor(a.length * 0.1)], p50: med, tiny: a.filter(function (x) { return x < med / 4; }).length }; })(),
     muxMs: { p50: _msePct(st.muxMs, 0.5), p90: _msePct(st.muxMs, 0.9), max: _msePct(st.muxMs, 1) },

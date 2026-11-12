@@ -287,6 +287,14 @@ void* MoonlightInstance::ConnectionThreadFunc(void* context) {
     PostToJs("Selecting the audio renderer capabilities to: CAPABILITY_DIRECT_SUBMIT");
   }
 
+  // With the MSE backend, submitting a frame only copies it into the ring that the player's worker
+  // reads, so it runs on the receive thread. The decoder thread would add one more wake-up to
+  // every frame, and each wake-up can come late.
+  const bool mseBackend = MAIN_THREAD_EM_ASM_INT({
+    return (typeof window !== "undefined" && window.mseActive === true) ? 1 : 0;
+  }) != 0;
+  MoonlightInstance::s_DrCallbacks.capabilities = CAPABILITY_SLICES_PER_FRAME(4) | (mseBackend ? CAPABILITY_DIRECT_SUBMIT : 0);
+
   err = LiStartConnection(&serverInfo, &me->m_StreamConfig, &MoonlightInstance::s_ClCallbacks,
     &MoonlightInstance::s_DrCallbacks, &MoonlightInstance::s_ArCallbacks, NULL, 0, NULL, 0);
   if (err != 0) {

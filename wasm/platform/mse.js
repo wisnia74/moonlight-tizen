@@ -27,6 +27,16 @@
 //   rateHold:   minimum time between two playback rate changes
 //   rateUntil:  once at rateHi, stay there until the buffer falls below this (hysteresis; default rateAbove)
 //   rateWindow: judge the buffer by its minimum over this many ms instead of the latest sample (0 = latest)
+//   floorFrames: the player's floor, in frame intervals: playback pauses when less than this is buffered
+//               ahead. With it set, the thresholds below are measured from the floor and replace rateAbove,
+//               rateUntil and rateBelow.
+//   marginHi, margin: play at rateHi once the buffer's minimum over rateWindow exceeds the floor by
+//               marginHi, until that minimum is back within margin of the floor
+//   marginLo, marginMid: play at rateLo once the buffer's median over rateWindow is within marginLo of
+//               the floor, until its median over the last 100 ms exceeds the floor by marginMid. Nothing
+//               else raises a buffer that sits at the floor, where playback pauses for a frame at a
+//               time. The median decides here because single late frames pull the minimum down without
+//               the level being low, and the short window stops the slow-down before it overshoots.
 // Read once when the stream starts (the rest also apply live through mseSetOpts):
 //   live:        how the init segment declares its duration. 'none': mvhd 0 and no mehd (Chromium
 //                already reads that as a live stream), 'mehd0': adds an mehd box of 0, 'max': all
@@ -45,7 +55,7 @@
 // The backend polls the gamepads from a 4 ms timer on the main thread instead of Moonlight's input
 // thread, whose every gamepad call waits for the main thread.
 var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 30,
-                     startAhead: 20, idrMB: 50, sceneMB: 8, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'block', waitMs: 3, reuse: true, uiPad: false, trimSlice: 1, trimGap: 50, diag: false, floorFrames: 4, margin: 12, marginHi: 37, gridPhase: true };
+                     startAhead: 20, idrMB: 50, sceneMB: 8, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'block', waitMs: 3, reuse: true, uiPad: false, trimSlice: 1, trimGap: 50, diag: false, floorFrames: 4, margin: 12, marginHi: 37, marginLo: 10, marginMid: 18, gridPhase: true };
 var MSE_TIMESCALE = 90000;
 // Kept across a hot reload, so a running stream's video element is not orphaned over the UI
 var _mse = window._mse || null;
@@ -469,7 +479,7 @@ function mseStop() {
 
 function _mseResetStats() {
   _mse.stats = { since: performance.now(), frames: 0, appended: 0, dropped: 0, idr: 0, resets: 0, seeks: 0, waiting: 0, trims: 0,
-                 rateMs: 0, ahead: [], recvToAppend: [], muxMs: [], appendMs: [], sizes: [], lag: [], reasm: [], cq: [], steps: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bytes: 0, q0: _mse.video.getVideoPlaybackQuality ? _mse.video.getVideoPlaybackQuality() : null };
+                 rateMs: 0, ahead: null, aheadN: 0, recvToAppend: [], muxMs: [], appendMs: [], sizes: [], lag: [], reasm: [], cq: [], steps: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bytes: 0, q0: _mse.video.getVideoPlaybackQuality ? _mse.video.getVideoPlaybackQuality() : null };
 }
 
 function _mseRequestIdr(reason) {
@@ -722,7 +732,8 @@ function _mseControl() {
     }
     return;
   }
-  s.stats.ahead.push(ahead);
+  var st = s.stats, ah = st.ahead || (st.ahead = new Float32Array(_MSE_AHEAD_MAX));
+  if (st.aheadN < _MSE_AHEAD_MAX) ah[st.aheadN++] = ahead;
   var nowMs = performance.now();
   if (v.currentTime !== s.lastCt) {
     if (s.stalled) _mseEvent('resume', Math.round(nowMs - s.lastCtAt));
@@ -745,18 +756,37 @@ function _mseControl() {
   }
   var gauge = ahead;
   if (o.rateWindow > 0) {
-    var ht = s.histT || (s.histT = []), hv = s.histV || (s.histV = []);
-    ht.push(nowMs); hv.push(ahead);
-    while (ht.length && ht[0] < nowMs - o.rateWindow) { ht.shift(); hv.shift(); }
-    for (var hi = 0; hi < hv.length; hi++) if (hv[hi] < gauge) gauge = hv[hi];
+    var h = s.hist || (s.hist = { t: new Float64Array(_MSE_HIST), v: new Float64Array(_MSE_HIST), tmp: new Float64Array(_MSE_HIST), head: 0, n: 0 });
+    if (h.n === _MSE_HIST) { h.head = (h.head + 1) % _MSE_HIST; h.n--; }
+    var at = (h.head + h.n) % _MSE_HIST, hx;
+    h.t[at] = nowMs; h.v[at] = ahead; h.n++;
+    while (h.n && h.t[h.head] < nowMs - o.rateWindow) { h.head = (h.head + 1) % _MSE_HIST; h.n--; }
+    for (var hi = 0; hi < h.n; hi++) { hx = h.v[(h.head + hi) % _MSE_HIST]; if (hx < gauge) gauge = hx; }
   }
   var until = o.rateUntil === undefined || o.rateUntil === null ? o.rateAbove : o.rateUntil, above = o.rateAbove;
   var cadence = s.worker ? s.ctl[5] : s.cadence;
   if (o.floorFrames > 0 && cadence > 0) { until = o.floorFrames * cadence + o.margin; above = o.floorFrames * cadence + o.marginHi; }
   s.floorMs = o.floorFrames > 0 && cadence > 0 ? o.floorFrames * cadence : null;
   var rate = gauge > above || (s.appliedRate === o.rateHi && o.rateHi !== 1 && gauge > until) ? o.rateHi : gauge < o.rateBelow ? o.rateLo : 1.0;
+  if (s.floorMs !== null && o.rateWindow > 0 && rate !== o.rateHi) {
+    var level = _mseMedian(s.hist, s.hist.n), recent = _mseMedian(s.hist, 10);
+    rate = level < s.floorMs + o.marginLo || (s.appliedRate === o.rateLo && recent < s.floorMs + o.marginMid) ? o.rateLo : 1.0;
+  }
   if ((s.appliedRate === undefined ? 1 : s.appliedRate) !== rate && nowMs - (s.lastRateAt || 0) >= o.rateHold) { v.playbackRate = rate; s.appliedRate = rate; s.lastRateAt = nowMs; _mseEvent('rate', rate); }
   if (rate !== 1.0) s.stats.rateMs += 10;
+}
+
+var _MSE_HIST = 256, _MSE_AHEAD_MAX = 32768;
+
+function _mseMedian(h, count) {
+  var n = Math.min(count, h.n), tmp = h.tmp, from = h.head + h.n - n, i, j, x;
+  if (!n) return 0;
+  for (i = 0; i < n; i++) {
+    x = h.v[(from + i) % _MSE_HIST];
+    for (j = i - 1; j >= 0 && tmp[j] > x; j--) tmp[j + 1] = tmp[j];
+    tmp[j + 1] = x;
+  }
+  return tmp[n >> 1];
 }
 
 function _msePct(a, p) {
@@ -769,7 +799,7 @@ function _msePct(a, p) {
 function mseSummary(reset) {
   var s = _mse;
   if (!s) return 'not running';
-  var st = s.stats, secs = (performance.now() - st.since) / 1000;
+  var st = s.stats, secs = (performance.now() - st.since) / 1000, ahead = st.ahead ? st.ahead.subarray(0, st.aheadN) : [];
   var q = s.video.getVideoPlaybackQuality ? s.video.getVideoPlaybackQuality() : null;
   var out = {
     secs: Math.round(secs * 10) / 10,
@@ -781,7 +811,7 @@ function mseSummary(reset) {
     catchUpPct: Math.round(st.rateMs / 10 / secs),
     steps: st.steps,
     floorMs: s.floorMs ? Math.round(s.floorMs * 10) / 10 : null,
-    aheadMs: { p10: _msePct(st.ahead, 0.1), p50: _msePct(st.ahead, 0.5), p90: _msePct(st.ahead, 0.9), max: _msePct(st.ahead, 1) },
+    aheadMs: { p10: _msePct(ahead, 0.1), p50: _msePct(ahead, 0.5), p90: _msePct(ahead, 0.9), max: _msePct(ahead, 1) },
     lagMs: { p50: _msePct(st.lag, 0.5), p90: _msePct(st.lag, 0.9), p99: _msePct(st.lag, 0.99), max: _msePct(st.lag, 1) },
     reasmMs: { p50: _msePct(st.reasm, 0.5), p90: _msePct(st.reasm, 0.9), p99: _msePct(st.reasm, 0.99), max: _msePct(st.reasm, 1) },
     queueMs: { p50: _msePct(st.cq, 0.5), p90: _msePct(st.cq, 0.9), p99: _msePct(st.cq, 0.99), max: _msePct(st.cq, 1) },

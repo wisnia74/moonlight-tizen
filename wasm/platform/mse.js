@@ -34,7 +34,9 @@
 //               ahead. With it set, the thresholds below are measured from the floor and replace rateAbove,
 //               rateUntil and rateBelow.
 //   marginHi, margin: play at rateHi once the buffer's minimum over rateWindow exceeds the floor by
-//               marginHi, until that minimum is back within margin of the floor
+//               marginHi, until that minimum is back within margin of the floor. With a smaller
+//               margin, catch-up ends so close to the floor that one late burst of frames empties
+//               the buffer and playback pauses.
 //   marginLo, marginMid: play at rateLo once the buffer's median over rateWindow is within marginLo of
 //               the floor, until its median over the last 100 ms exceeds the floor by marginMid. Nothing
 //               else raises a buffer that sits at the floor, where playback pauses for a frame at a
@@ -67,7 +69,7 @@
 // The backend polls the gamepads from a 4 ms timer on the main thread instead of Moonlight's input
 // thread, whose every gamepad call waits for the main thread.
 var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 60, startSeekAbove: 150,
-                     startAhead: 20, idrMB: 50, sceneMB: 30, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'block', waitMs: 3, reuse: true, uiPad: false, trimSlice: 1, trimGap: 50, diag: false, floorFrames: 4, margin: 12, marginHi: 37, marginLo: 10, marginMid: 18, rebuildAt: 63000, gridPhase: true };
+                     startAhead: 20, idrMB: 50, sceneMB: 30, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'block', waitMs: 3, reuse: true, uiPad: false, trimSlice: 1, trimGap: 50, diag: false, floorFrames: 4, margin: 20, marginHi: 37, marginLo: 10, marginMid: 18, rebuildAt: 63000, gridPhase: true };
 var MSE_TIMESCALE = 90000;
 // Kept across a hot reload, so a running stream's video element is not orphaned over the UI
 var _mse = window._mse || null;

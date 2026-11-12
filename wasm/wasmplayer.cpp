@@ -544,8 +544,15 @@ int MoonlightInstance::VidDecSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
       AddVideoStats(m_ActiveWndVideoStats, lastTwoWndStats);
       // Convert the aggregated stats to a display string
       FormatVideoStats(lastTwoWndStats, s_StatString.data(), s_StatString.length());
-      // Send the formatted stats string to the JS frontend for overlay display
-      PostToJs(std::string("StatMsg: ") + s_StatString.data());
+      // Send the formatted stats string to the JS frontend for overlay display, without waiting
+      // for it. Every frame passes through this thread, and a synchronous call holds the thread
+      // until the page's main thread is free. The page reads the text after this function
+      // returns, so the text stays in a buffer that is only rewritten in the next stats window.
+      static std::string s_StatPosted;
+      s_StatPosted = std::string("StatMsg: ") + s_StatString.data();
+      MAIN_THREAD_ASYNC_EM_ASM({
+        handleMessage(UTF8ToString($0));
+      }, s_StatPosted.c_str());
       // Clear the stats string buffer for the next use
       std::fill(s_StatString.begin(), s_StatString.end(), 0);
     }

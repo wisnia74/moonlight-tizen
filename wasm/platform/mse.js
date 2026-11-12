@@ -56,7 +56,7 @@
 //                already reads that as a live stream), 'mehd0': adds an mehd box of 0, 'max': all
 //                durations 0xFFFFFFFF ("unknown")
 //   latencyHint: seconds for Chromium's experimental HTMLMediaElement.latencyHint, null leaves it unset
-//   mux:         'fast' (one allocation per frame) or 'old' (the session 2 muxer), for A/B runs
+//   mux:         'fast' (one allocation per frame) or 'old' (an array per NAL unit, then a copy into the sample), for A/B runs
 //   worker:      true runs the MediaSource, muxer and appends in a dedicated worker that the decoder
 //                thread wakes directly, so no frame waits for the page's main thread. Needs
 //                MediaSource.canConstructInDedicatedWorker and Atomics.waitAsync; falls back otherwise.

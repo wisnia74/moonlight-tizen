@@ -1,10 +1,9 @@
 // Audio scheduler for the Web Audio backend.
 //
 // The WASM module decodes each Opus packet on its own audio thread, converts it to planar
-// 32-bit float samples and then calls _audReceiveFrame() on the main thread with a pointer to
-// those samples. The frames are scheduled against the audio hardware clock instead of being
-// polled by a timer, so the TV throttling the timers while an overlay is on screen cannot
-// interrupt playback.
+// 32-bit float samples and publishes the frame in a queue in the WASM heap. A timer on the main
+// thread polls that queue and schedules the new frames against the audio hardware clock, so a
+// poll that runs late delays only the scheduling, and playback continues from the jitter buffer.
 //
 // The audio context is created by startAudioScheduler() from the user gesture that starts
 // the stream, because the autoplay policy blocks contexts created outside of a gesture.

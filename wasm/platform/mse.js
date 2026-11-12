@@ -64,8 +64,16 @@
 //                new ArrayBuffer per frame, whose garbage froze the worker ~100 ms every ~24 s
 //   uiPad:       false pauses Moonlight's menu gamepad poller (gamepad.js, every 5 ms on the main thread)
 //                while the stream runs; the stream's own input goes through the C++ side
-//   wake:        how the worker waits for the next frame: 'async' (Atomics.waitAsync), 'spin' (busy poll
-//                through its task queue), 'timer' (setTimeout 1), 'wait' (Atomics.wait up to waitMs, then yield)
+//   wake:        how the worker waits for the next frame: 'block' (Atomics.wait until a frame arrives,
+//                returning to the event loop only while an append or trim is in flight), 'async'
+//                (Atomics.waitAsync), 'spin' (busy poll through its task queue), 'timer' (setTimeout 1),
+//                'wait' (Atomics.wait up to waitMs, then yield)
+//   gridPhase:   with pts 'grid', move the grid by half a slot when frames keep landing near the edge
+//                of their slots, where they fall to either side of it from one frame to the next
+//   trimSlice, trimGap: free the buffer behind playback in slices of trimSlice seconds, one every
+//                trimGap ms, because one remove() over a whole stretch between keyframes stalls the
+//                thread that appends the frames
+//   diag:        true adds the worker's heartbeat timer and the 'pgap' event to the event log
 // The backend polls the gamepads from a 4 ms timer on the main thread instead of Moonlight's input
 // thread, whose every gamepad call waits for the main thread.
 var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 60, startSeekAbove: 150,

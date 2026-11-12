@@ -52,7 +52,7 @@ static size_t s_MseRingPos = 0;
 static int s_MseNeedIdr = 0;
 // Worker mode (mseOpts.worker): instead of a call on the main thread, each frame goes into this
 // queue and wakes mse.js's worker: [write count, then kMseSlots slots of kMseSlotInts ints:
-// pointer, length, IDR, frame number, PTS ms, receive time ms]
+// pointer, length, IDR, frame number, PTS ms, receive time ms, enqueue time ms, submit time ms]
 static constexpr int kMseSlots = 64;
 static constexpr int kMseSlotInts = 8;
 static int32_t s_MseQueue[1 + kMseSlots * kMseSlotInts];

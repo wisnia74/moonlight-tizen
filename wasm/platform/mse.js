@@ -348,6 +348,8 @@ function _mseStartWorker(s, queueAddr) {
       _mseEvent(m.kind, m.info);
     } else if (m.type === 'stats') {
       ['frames', 'appended', 'dropped', 'idr', 'resets', 'trims', 'bytes'].forEach(function (k) { st[k] += m.stats[k]; });
+      // Nothing reads these unless the inspector asks for a summary, so they start over before they grow large
+      if (st.lag.length > 30000) _mseResetStats();
       ['recvToAppend', 'muxMs', 'appendMs', 'sizes', 'lag', 'reasm', 'cq'].forEach(function (k) { Array.prototype.push.apply(st[k], m.stats[k]); });
     }
   };
@@ -438,7 +440,7 @@ function _mseEvent(kind, info) {
   var v = s.video, b = s.sb && s.sb.buffered.length ? s.sb.buffered : null;
   s.events.push([Math.round(performance.now()), kind, info === undefined ? null : info, Math.round(v.currentTime * 1000),
     s.newest !== undefined ? Math.round((s.newest - v.currentTime) * 1000) : null]);
-  if (s.events.length > 60000) s.events.shift();
+  if (s.events.length > 20000) s.events.splice(0, 5000);
 }
 
 // [time ms, kind, info, currentTime ms, buffered ahead ms] since the given time

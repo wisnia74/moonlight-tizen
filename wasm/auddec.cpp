@@ -69,6 +69,10 @@ static opus_int16 s_AudioPcm[kAudioSlotElements];
 // it to the main thread as gaps in its statistics
 static int s_AudioSequence = 0;
 
+// What the scheduler polls instead of receiving a call per frame: [0] the number of frames
+// written so far, then the samples per channel of the frame in each slot
+static int32_t s_AudioQueue[1 + kAudioSlotCount];
+
 // Frames the Opus decoder rejected since the last time it was reported
 static int s_AudioDecodeErrors = 0;
 
@@ -167,14 +171,11 @@ static void DecodeAndScheduleFrame(OpusMSDecoder* decoder, const unsigned char* 
   // Number this frame so the scheduler can report the ones that never reached the main thread
   int sequence = s_AudioSequence++;
 
-  // Hand the decoded samples to the audio scheduler running on the main thread. This is
-  // asynchronous, so the audio thread is never blocked waiting on the browser event loop.
-  MAIN_THREAD_ASYNC_EM_ASM({
-    if (typeof _audReceiveFrame === 'function') {
-      _audReceiveFrame($0, $1, $2, $3, $4, $5);
-    }
-  }, (int)(size_t)slot, decodeLen, (int)s_channelCount, s_sampleRate,
-     (int)kAudioSlotStride, sequence);
+  // Publish the frame to the audio scheduler, which polls this count from a timer on the main
+  // thread. A call proxied to the main thread for every frame takes the lock of the proxy
+  // queue 200 times a second, and whenever the main thread finds it taken, it spins on it.
+  s_AudioQueue[1 + (sequence % kAudioSlotCount)] = decodeLen;
+  __atomic_store_n(&s_AudioQueue[0], sequence + 1, __ATOMIC_SEQ_CST);
 }
 
 int MoonlightInstance::AudDecInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, void* context, int arFlags) {
@@ -249,9 +250,14 @@ int MoonlightInstance::AudDecInit(int audioConfiguration, POPUS_MULTISTREAM_CONF
     ClLogMessage("Selected the Web Audio backend with a jitter buffer of %d ms\n", audioJitterMs);
 
     // Publish the jitter buffer target to the audio scheduler in platform/audio.js
+    __atomic_store_n(&s_AudioQueue[0], 0, __ATOMIC_SEQ_CST);
     MAIN_THREAD_ASYNC_EM_ASM({
       window._mlAudioTargetMs = $0;
-    }, audioJitterMs);
+      if (typeof _audAttachQueue === 'function') {
+        _audAttachQueue($1, $2, $3, $4, $5, $6, $7);
+      }
+    }, audioJitterMs, (int)(size_t)&s_AudioQueue[0], (int)(size_t)&s_AudioSlots[0][0], (int)kAudioSlotCount,
+       (int)(sizeof(float) * kAudioSlotElements), (int)kAudioSlotStride, (int)s_channelCount, s_sampleRate);
   } else {
     ClLogMessage("Selected the EMSS audio backend\n");
   }

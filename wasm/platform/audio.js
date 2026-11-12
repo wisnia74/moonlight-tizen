@@ -32,6 +32,17 @@ var AUD_DEFAULT_TARGET_MS = 100;
 // Audio context rendering the stream, or null while the EMSS backend is selected
 var _audContext = null;
 
+// Frames published by the WASM module and the timer that polls them, see _audAttachQueue()
+var _audQueue = null;
+
+// Time between two polls of the decoded frames. Each poll schedules the frames that arrived
+// since the last one as a single audio buffer, and a buffer per 5 ms frame leaves enough
+// garbage behind for collections that stall the main thread for over 50 ms.
+var AUD_POLL_INTERVAL_MS = 20;
+
+// Most frames that one audio buffer may carry
+var AUD_MAX_BATCH = 8;
+
 // Time on the audio hardware clock, in seconds, at which the next frame should start playing
 var _audNextTime = 0.0;
 
@@ -202,8 +213,63 @@ function startAudioScheduler() {
     ' up to ' + _audContext.destination.maxChannelCount + ' output channels.');
 }
 
+// Start polling the decoded frames the WASM module publishes in its heap
+//   countAddr  - byte offset of the count of frames written so far, followed by the number of
+//                samples per channel of the frame in each slot (32-bit integers)
+//   slotsAddr  - byte offset of the first slot of planar 32-bit float samples
+//   slotCount  - number of slots, which the WASM module fills in rotation
+//   slotBytes  - size of a slot in bytes
+//   stride     - number of samples between the channels of a frame
+//   channels, sampleRate - format of the stream
+function _audAttachQueue(countAddr, slotsAddr, slotCount, slotBytes, stride, channels, sampleRate) {
+  if (_audQueue) {
+    clearInterval(_audQueue.timer);
+  }
+  _audQueue = {
+    count: countAddr >> 2, slots: slotsAddr, slotCount: slotCount, slotBytes: slotBytes, stride: stride,
+    channels: channels, sampleRate: sampleRate, read: 0, timer: setInterval(_audPoll, AUD_POLL_INTERVAL_MS)
+  };
+}
+
+// Schedule every frame the WASM module has written since the last poll
+function _audPoll() {
+  var queue = _audQueue;
+  if (!queue) {
+    return;
+  }
+  var heap = Module.HEAP32;
+  var written = Atomics.load(heap, queue.count);
+
+  // Skip the frames whose slots were written again before this poll got to them
+  if (written < queue.read || written - queue.read > queue.slotCount / 2) {
+    queue.read = Math.max(0, written - queue.slotCount / 2);
+  }
+  while (queue.read < written) {
+    var slot = queue.read % queue.slotCount;
+    var samples = heap[queue.count + 1 + slot];
+    var offsets = [queue.slots + slot * queue.slotBytes];
+
+    // Frames of the same length go out as one audio buffer when no resampling is involved
+    if (_audStreamRate === queue.sampleRate && _audRatio === 1.0) {
+      while (queue.read + offsets.length < written && offsets.length < AUD_MAX_BATCH) {
+        var next = (queue.read + offsets.length) % queue.slotCount;
+        if (heap[queue.count + 1 + next] !== samples) {
+          break;
+        }
+        offsets.push(queue.slots + next * queue.slotBytes);
+      }
+    }
+    _audReceiveFrame(offsets[0], samples, queue.channels, queue.sampleRate, queue.stride, queue.read, offsets);
+    queue.read += offsets.length;
+  }
+}
+
 // Stop accepting decoded frames and release the audio context
 function stopAudioScheduler() {
+  if (_audQueue) {
+    clearInterval(_audQueue.timer);
+    _audQueue = null;
+  }
   if (_audContext && _audStats) {
     _audLogStatistics(true);
   }
@@ -250,16 +316,20 @@ function _audAdoptStreamFormat(sampleRate, channels) {
 // the audio context when the two differ. The resampler interpolates from the last sample of the
 // previous frame and carries its position over, so no discontinuity is introduced at the frame
 // boundaries. Returns the buffer to schedule, or null when the frame produced no samples.
-function _audBuildBuffer(heapOffset, samples, channels, stride) {
+function _audBuildBuffer(heapOffset, samples, channels, stride, offsets) {
   var heap = Module.HEAPF32;
   var base = heapOffset >> 2;
   var channel;
 
   if (_audRatio === 1.0) {
-    var direct = _audContext.createBuffer(channels, samples, _audContext.sampleRate);
+    var frames = offsets || [heapOffset];
+    var direct = _audContext.createBuffer(channels, samples * frames.length, _audContext.sampleRate);
     for (channel = 0; channel < channels; channel++) {
-      var offset = base + channel * stride;
-      direct.getChannelData(channel).set(heap.subarray(offset, offset + samples));
+      var data = direct.getChannelData(channel);
+      for (var frame = 0; frame < frames.length; frame++) {
+        var offset = (frames[frame] >> 2) + channel * stride;
+        data.set(heap.subarray(offset, offset + samples), frame * samples);
+      }
     }
     return direct;
   }
@@ -309,20 +379,23 @@ function _audBuildBuffer(heapOffset, samples, channels, stride) {
 //   sampleRate - sample rate of the frame in Hz (48000)
 //   stride     - number of samples between the channels of the frame in the WASM heap
 //   sequence   - index of the frame in the stream, used to detect frames that never arrived
-function _audReceiveFrame(heapOffset, samples, channels, sampleRate, stride, sequence) {
+//   offsets    - byte offsets of this frame and the ones that follow it into the same audio
+//                buffer, when the scheduler polls the frames itself
+function _audReceiveFrame(heapOffset, samples, channels, sampleRate, stride, sequence, offsets) {
   if (!_audRunning || !_audContext) {
     return;
   }
 
   var stats = _audStats;
-  stats.received++;
+  var frameCount = offsets ? offsets.length : 1;
+  stats.received += frameCount;
 
   // Count the frames the WASM module decoded that never reached the scheduler, which happens
   // when the main thread was not serviced for long enough that the slot pool wrapped around
   if (stats.lastSequence >= 0 && sequence > stats.lastSequence + 1) {
     stats.decoderGaps += sequence - stats.lastSequence - 1;
   }
-  stats.lastSequence = sequence;
+  stats.lastSequence = sequence + frameCount - 1;
 
   // The audio context starts suspended when the stream begins without a user gesture, and the
   // TV may suspend it again while it reconfigures its audio output, so resume it and let the
@@ -373,7 +446,7 @@ function _audReceiveFrame(heapOffset, samples, channels, sampleRate, stride, seq
     return;
   }
 
-  var buffer = _audBuildBuffer(heapOffset, samples, channels, stride);
+  var buffer = _audBuildBuffer(heapOffset, samples, channels, stride, offsets);
   if (!buffer) {
     stats.droppedEmpty++;
     _audLogStatistics(false);

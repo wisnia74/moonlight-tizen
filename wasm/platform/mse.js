@@ -20,6 +20,11 @@
 //               appends once about 80 MB are buffered. At the stream's full bitrate the buffer peaks
 //               up to about 10 MB above this value. Each keyframe shows as a brief flicker, so a
 //               size limit asks for far fewer of them than a fixed interval would.
+//   idrSec:     also ask for a keyframe once this many seconds have passed since the last one
+//               (0 = never). The TV's player takes longer to append a frame the more video the
+//               buffer holds. After a few minutes without a trim, an append takes longer than a
+//               frame interval, so frames queue up and playback falls behind. A still picture
+//               sends so little data that idrMB alone leaves the buffer untrimmed for that long.
 //   sceneMB, sceneRatio: once sceneMB have arrived since the last keyframe, ask for one right after
 //               a frame sceneRatio times bigger than the recent average, such as a cut or a fade,
 //               where its flicker cannot be seen
@@ -77,7 +82,7 @@
 // The backend polls the gamepads from a 4 ms timer on the main thread instead of Moonlight's input
 // thread, whose every gamepad call waits for the main thread.
 var MSE_DEFAULTS = { pts: 'grid', rateAbove: 70, rateHi: 1.05, rateBelow: -1e9, rateLo: 0.95, rateUntil: 45, rateWindow: 500, seekAbove: 400, seekTarget: 60, startSeekAbove: 150,
-                     startAhead: 20, idrMB: 50, sceneMB: 30, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'block', waitMs: 3, reuse: true, uiPad: false, trimSlice: 1, trimGap: 50, diag: false, floorFrames: 4, margin: 20, marginHi: 37, marginLo: 10, marginMid: 18, rebuildAt: 63000, gridPhase: true };
+                     startAhead: 20, idrMB: 50, idrSec: 30, sceneMB: 30, sceneRatio: 3, durMs: 50, rateHold: 250, live: 'none', latencyHint: null, mux: 'fast', worker: true, wake: 'block', waitMs: 3, reuse: true, uiPad: false, trimSlice: 1, trimGap: 50, diag: false, floorFrames: 4, margin: 20, marginHi: 37, marginLo: 10, marginMid: 18, rebuildAt: 63000, gridPhase: true };
 var MSE_TIMESCALE = 90000;
 // Kept across a hot reload, so a running stream's video element is not orphaned over the UI
 var _mse = window._mse || null;
@@ -609,15 +614,18 @@ function _mseReceiveFrame(ptr, len, idr, frameNumber, ptsMs, recvMs, reasmMs, qu
   }
   if (nalStart >= 0 && nalType !== 38) payload += len - nalStart;
   s.stats.sizes.push(payload);
-  if (idr) { s.keyBytes = 0; s.askedAt = null; }
+  if (idr) { s.keyBytes = 0; s.askedAt = null; s.keyAt = now; }
   else {
     var avg = s.avgBytes || payload, mb = 1048576;
     s.keyBytes = (s.keyBytes || 0) + payload;
-    var scene = s.keyBytes > s.opts.sceneMB * mb && payload > s.opts.sceneRatio * avg;
-    if ((scene || s.keyBytes > s.opts.idrMB * mb) && (s.askedAt === null || s.askedAt === undefined || s.keyBytes - s.askedAt > 4 * mb)) {
-      s.askedAt = s.keyBytes;
+    var scene = s.keyBytes > s.opts.sceneMB * mb && payload > s.opts.sceneRatio * avg, size = s.keyBytes > s.opts.idrMB * mb;
+    var time = s.opts.idrSec > 0 && now - s.keyAt > s.opts.idrSec * 1000;
+    // A request that brought no keyframe is repeated after 4 MB or 2 s, because on a still picture
+    // 4 MB can take minutes to arrive
+    if ((scene || size || time) && (s.askedAt === null || s.askedAt === undefined || s.keyBytes - s.askedAt > 4 * mb || now - s.askedMs > 2000)) {
+      s.askedAt = s.keyBytes; s.askedMs = now;
       Atomics.store(HEAP32, s.needIdrAddr >> 2, 2);
-      _mseEvent('idrReq', scene ? 'scene' : 'size');
+      _mseEvent('idrReq', scene ? 'scene' : size ? 'size' : 'time');
     }
     s.avgBytes = avg * 0.95 + payload * 0.05;
   }
